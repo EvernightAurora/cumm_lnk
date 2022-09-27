@@ -24,6 +24,7 @@ import numpy as np
 import pccm
 from ccimport import compat
 from pccm.core import CodeFormatter, FunctionCode
+from cumm.conv.bases import ConvGroupMode, ConvOpType
 
 # from myclang import clangformat
 from cumm import cudasim, dtypes
@@ -59,7 +60,8 @@ class GemmAlgoParams(object):
             splitk_parallel: bool = False,
             shuffle_stride: ShuffleStrideType = ShuffleStrideType.NoShuffle,
             access_per_vector: int = 1,
-            is_nvrtc: bool = False):
+            is_nvrtc: bool = False,
+            group_mode: ConvGroupMode = ConvGroupMode.kNone):
         self.ts = MetaArray(*ts)
         self.wts = MetaArray(*wts)
         self.num_stage = num_stage
@@ -85,6 +87,7 @@ class GemmAlgoParams(object):
         self.shuffle_stride = shuffle_stride
         self.access_per_vector = access_per_vector
         self.is_nvrtc = is_nvrtc
+        self.group_mode = group_mode
 
 
     def support_splitk(self):
@@ -95,7 +98,30 @@ class GemmAlgoParams(object):
             if self.tensorop is not None:
                 if (self.trans_a or not self.trans_b):
                     return True
+        if self.group_mode != ConvGroupMode.kNone:
+            if self.trans_a and not self.trans_b:
+                return True
         return False
+
+
+def gen_grouped_conv_gemm_params(
+        ts,
+        wts,
+        stage: int,
+        dtypes_string: str,
+        algo: kernel.GemmAlgo,
+        tensorop: Optional[kernel.TensorOp],
+        conv_op: ConvOpType = ConvOpType.kForward,
+        group_mode: ConvGroupMode = ConvGroupMode.kSingleGroup):
+    res = []
+    tc = False
+    ta = False if (conv_op in [ConvOpType.kForward, ConvOpType.kBackwardInput]) else True
+    tb = False if (conv_op == ConvOpType.kBackwardInput) else True
+    p = GemmAlgoParams(ts, wts, stage, dtypes_string, ta, tb, tc, algo, tensorop, group_mode=group_mode)
+    if not p.skipped():
+        res.append(p)
+    return res
+
 
 def gen_gemm_params(
         ts,
@@ -303,7 +329,8 @@ def gen_gemm_kernels(params: GemmAlgoParams,
                              splitk_parallel=params.splitk_parallel,
                              shuffle_stride=params.shuffle_stride,
                              access_per_vector=params.access_per_vector,
-                             nvrtc_mode=nvrtc_mode)
+                             nvrtc_mode=nvrtc_mode,
+                             group_mode=params.group_mode)
 
 
 class SpconvKernel(pccm.Class):
@@ -639,7 +666,7 @@ class GemmMainUnitTest(pccm.ParameterizedClass):
                 
 
 
-                    # *gen_gemm_params_xxrow((32, 16, 16), (16, 16, 16), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
+                    *gen_gemm_params_xxrow((32, 16, 16), (16, 16, 16), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
                     # *gen_gemm_params_xxrow((64, 16, 16), (16, 16, 16), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
                     # *gen_gemm_params_xxrow((128, 16, 16), (16, 16, 16), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
                     # *gen_gemm_params_xxrow((64, 16, 16), (32, 16, 16), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
@@ -652,6 +679,22 @@ class GemmMainUnitTest(pccm.ParameterizedClass):
                     # *gen_gemm_params_xxrow((64, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
                     # *gen_gemm_params_xxrow((128, 32, 32), (64, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
                     
+                    
+                    # *gen_grouped_conv_gemm_params((32, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8]), 
+                    #                                 ConvOpType.kForward, ConvGroupMode.kSingleGroup),
+                    # *gen_grouped_conv_gemm_params((32, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8]), 
+                    #                                 ConvOpType.kBackwardInput, ConvGroupMode.kSingleGroup),
+                    # *gen_grouped_conv_gemm_params((32, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8]), 
+                    #                                 ConvOpType.kBackwardWeight, ConvGroupMode.kSingleGroup),
+
+                    *gen_grouped_conv_gemm_params((32, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8]), 
+                                                    ConvOpType.kForward, ConvGroupMode.kSingleGroupUnaligned),
+                    *gen_grouped_conv_gemm_params((32, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8]), 
+                                                    ConvOpType.kBackwardInput, ConvGroupMode.kSingleGroupUnaligned),
+                    *gen_grouped_conv_gemm_params((32, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8]), 
+                                                    ConvOpType.kBackwardWeight, ConvGroupMode.kSingleGroupUnaligned),
+                    
+
                     
                 ]
                 ampere_params = [
@@ -1560,7 +1603,9 @@ class GemmMainUnitTest(pccm.ParameterizedClass):
                       dcomp: dtypes.DType,
                       algo: str,
                       tensorop: np.ndarray,
-                      split_k_slices: int = 1):
+                      split_k_slices: int = 1,
+                      groups: int = 1,
+                      group_mode: ConvGroupMode = ConvGroupMode.kNone):
         found = False
         for p, ker in zip(self.all_params, self.all_kernels):
             if_tests = [
@@ -1577,6 +1622,7 @@ class GemmMainUnitTest(pccm.ParameterizedClass):
                 p.dtype_acc == dacc,
                 p.dtype_comp == dcomp,
                 algo == p.algo.value,
+                p.group_mode == group_mode
             ]
             if all(if_tests):
                 found = True
@@ -1602,7 +1648,8 @@ class GemmMainUnitTest(pccm.ParameterizedClass):
                 m = a_ten.shape[int(trans_a)]
                 k = a_ten.shape[int(not trans_a)]
                 k2 = b_ten.shape[int(trans_b)]
-                assert k2 == k
+                if ker.group_mode == ConvGroupMode.kNone:
+                    assert k2 == k
                 n = b_ten.shape[int(not trans_b)]
                 if cudasim.enable_debug():
                     a_ptr = ArrayPtr(p.dtype_a.tv_dtype,
@@ -1636,7 +1683,8 @@ class GemmMainUnitTest(pccm.ParameterizedClass):
                     c_ptr,
                     1.0,
                     1.0,
-                    split_k_slices=split_k_slices)
+                    split_k_slices=split_k_slices,
+                    groups=groups)
                 func = partial(ker.gemm_kernel_python, params=params)
                 blocks = params.grid_dims
                 threads = cudasim.Dim3(ker.num_threads, 1, 1)

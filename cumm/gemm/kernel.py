@@ -14,6 +14,7 @@
 
 import enum
 from pathlib import Path
+from tokenize import group
 from typing import Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
@@ -39,6 +40,7 @@ from cumm.gemm.utils import GemmUtils, GemmUtilsCPU
 from cumm.gemm.wmma.simt import WarpMmaSimt
 from cumm.gemm.constants import NVRTCConstants
 from cumm.gemm.bases import GemmComponentBase
+from cumm.conv.bases import ConvGroupMode, ConvOpType
 
 def div_up(a, b):
     return (a + b - 1) // b
@@ -84,7 +86,8 @@ class GemmParams(pccm.ParameterizedClass):
             out_params: out_iters.OutIteratorParams,
             have_workspace: bool = False,
             shuffle_stride: ShuffleStrideType = ShuffleStrideType.NoShuffle,
-            split_d_params: bool = False):
+            split_d_params: bool = False,
+            group_mode: ConvGroupMode = ConvGroupMode.kNone):
         super().__init__()
 
         self.add_dependency(TensorViewNVRTC, GemmBasic, GemmUtilsCPU)
@@ -111,6 +114,20 @@ class GemmParams(pccm.ParameterizedClass):
         self.trans_a = trans_a
         self.trans_b = trans_b
         self.trans_c = trans_c
+        self.group_mode = group_mode
+        if self.group_mode != ConvGroupMode.kNone:
+            self.add_member("groups", "int")
+            self.conv_type:  ConvOpType
+            if not trans_a:
+                if trans_b:
+                    self.conv_type = ConvOpType.kForward
+                else:
+                    self.conv_type = ConvOpType.kBackwardInput
+            else:
+                if trans_b:
+                    self.conv_type = ConvOpType.kBackwardWeight
+                else:
+                    raise ValueError
 
         self.add_member("gemm_k_size_per_split, m, n, k", "int")
         self.add_member("ptr_A", f"const {dtype_a}*")
@@ -163,6 +180,7 @@ class GemmParams(pccm.ParameterizedClass):
         self.itera_params_: Optional[mask_iters.MaskTileIteratorParams] = None
         self.iterb_params_: Optional[mask_iters.MaskTileIteratorParams] = None
         self.out_params_: Optional[out_iters.OutIteratorParams] = None
+        self.groups = 1
 
     def python_ctor(self,
                     m: int,
@@ -174,20 +192,131 @@ class GemmParams(pccm.ParameterizedClass):
                     D: ArrayPtr,
                     alpha: float,
                     beta: float,
-                    split_k_slices: int = 1):
+                    split_k_slices: int = 1,
+                    groups: int = 1):
         new_obj = GemmParams(self.tile_shape, self.dtype_a, self.dtype_b,
                              self.dtype_c, self.dtype_comp, self.trans_a,
                              self.trans_b, self.trans_c, self.itera_params,
-                             self.iterb_params, self.out_params)
-        new_obj.grid_dims.x = mask_iters.div_up(m, new_obj.tile_shape[0])
-        new_obj.grid_dims.y = mask_iters.div_up(n, new_obj.tile_shape[1])
-        new_obj.grid_dims.z = split_k_slices
+                             self.iterb_params, self.out_params, group_mode=self.group_mode)
+        new_obj.groups = groups
+        if self.group_mode == ConvGroupMode.kNone:
+            new_obj.grid_dims.x = mask_iters.div_up(m, new_obj.tile_shape[0])
+            new_obj.grid_dims.y = mask_iters.div_up(n, new_obj.tile_shape[1])
+            new_obj.grid_dims.z = split_k_slices
 
-        total_gemm_k_iterations = mask_iters.div_up(k, new_obj.tile_shape[2])
-        gemm_k_iterations = mask_iters.div_up(total_gemm_k_iterations,
-                                              new_obj.grid_dims.z)
-        new_obj.gemm_k_size = gemm_k_iterations * new_obj.tile_shape[2]
+            total_gemm_k_iterations = mask_iters.div_up(k, new_obj.tile_shape[2])
+            gemm_k_iterations = mask_iters.div_up(total_gemm_k_iterations,
+                                                new_obj.grid_dims.z)
+            new_obj.gemm_k_size = gemm_k_iterations * new_obj.tile_shape[2]
+            a_shape = [m, k]
+            b_shape = [k, n]
+            c_shape = [m, n]
 
+        elif self.group_mode == ConvGroupMode.kSingleGroup:
+            if self.conv_type == ConvOpType.kForward:
+                assert split_k_slices == 1
+                c_per_group = k // groups
+                assert k % groups == 0
+                assert n % groups == 0
+                k_per_group = n // groups
+                assert c_per_group % self.tile_shape[2] == 0
+                assert k_per_group % self.tile_shape[1] == 0
+                new_obj.grid_dims.x = mask_iters.div_up(m, new_obj.tile_shape[0])
+                new_obj.grid_dims.y = n // new_obj.tile_shape[1]
+                new_obj.grid_dims.z = 1
+                new_obj.gemm_k_size = k
+                a_shape = [m, k]
+                b_shape = [k // groups, n]
+                c_shape = [m, n]
+            elif self.conv_type == ConvOpType.kBackwardInput:
+                assert split_k_slices == 1
+                k_per_group = k // groups
+                c_per_group = n
+                assert k % groups == 0
+                assert k_per_group % new_obj.tile_shape[2] == 0
+                assert c_per_group % new_obj.tile_shape[1] == 0
+                new_obj.grid_dims.x = mask_iters.div_up(m, new_obj.tile_shape[0])
+                new_obj.grid_dims.y = c_per_group // new_obj.tile_shape[1]
+                new_obj.grid_dims.z = groups
+                new_obj.gemm_k_size = k_per_group
+                a_shape = [m, k]
+                b_shape = [k, n]
+                c_shape = [m, n * groups]
+            elif self.conv_type == ConvOpType.kBackwardWeight:
+                k_per_group = m // groups
+                c_per_group = n // groups
+                assert m % groups == 0 and n % groups == 0
+                assert k_per_group % self.tile_shape[0] == 0 and c_per_group % self.tile_shape[1] == 0
+                new_obj.grid_dims.x = k_per_group // new_obj.tile_shape[0] * groups
+                new_obj.grid_dims.y = c_per_group // new_obj.tile_shape[1]
+                new_obj.grid_dims.z = split_k_slices
+
+                total_gemm_k_iterations = mask_iters.div_up(k, new_obj.tile_shape[2])
+                gemm_k_iterations = mask_iters.div_up(total_gemm_k_iterations,
+                                                    new_obj.grid_dims.z)
+                new_obj.gemm_k_size = gemm_k_iterations * new_obj.tile_shape[2]
+                a_shape = [m, k]
+                b_shape = [k, n]
+                c_shape = [m, n // groups]
+            new_obj.k_per_group = k_per_group
+            new_obj.c_per_group = c_per_group
+        elif self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+            if self.conv_type == ConvOpType.kForward:
+                assert split_k_slices == 1
+                c_per_group = k // groups
+                assert k % groups == 0
+                assert n % groups == 0
+                k_per_group = n // groups
+                # assert c_per_group % self.tile_shape[2] == 0
+                # assert k_per_group % self.tile_shape[1] == 0
+                tiles_per_c = mask_iters.div_up(c_per_group, new_obj.tile_shape[2])
+                tiles_per_k = mask_iters.div_up(k_per_group, new_obj.tile_shape[1])
+                new_obj.grid_dims.x = mask_iters.div_up(m, new_obj.tile_shape[0])
+                new_obj.grid_dims.y = tiles_per_k * groups
+                new_obj.grid_dims.z = 1
+                new_obj.gemm_k_size = k
+                a_shape = [m, k]
+                b_shape = [k // groups, n]
+                c_shape = [m, n]
+            elif self.conv_type == ConvOpType.kBackwardInput:
+                assert split_k_slices == 1
+                k_per_group = k // groups
+                c_per_group = n
+                assert k % groups == 0
+                # assert k_per_group % new_obj.tile_shape[2] == 0
+                # assert c_per_group % new_obj.tile_shape[1] == 0
+                tiles_per_c = mask_iters.div_up(c_per_group, new_obj.tile_shape[2])
+                tiles_per_k = mask_iters.div_up(k_per_group, new_obj.tile_shape[1])
+
+                new_obj.grid_dims.x = mask_iters.div_up(m, new_obj.tile_shape[0])
+                new_obj.grid_dims.y = tiles_per_k * groups
+                new_obj.grid_dims.z = groups
+                new_obj.gemm_k_size = k_per_group
+                a_shape = [m, k]
+                b_shape = [k, n]
+                c_shape = [m, n * groups]
+            elif self.conv_type == ConvOpType.kBackwardWeight:
+                k_per_group = m // groups
+                c_per_group = n // groups
+                assert m % groups == 0 and n % groups == 0
+                # assert k_per_group % self.tile_shape[0] == 0 and c_per_group % self.tile_shape[1] == 0
+                tiles_per_c = mask_iters.div_up(c_per_group, new_obj.tile_shape[2])
+                tiles_per_k = mask_iters.div_up(k_per_group, new_obj.tile_shape[1])
+                new_obj.grid_dims.x = tiles_per_k * groups
+                new_obj.grid_dims.y = tiles_per_c
+                new_obj.grid_dims.z = split_k_slices
+
+                total_gemm_k_iterations = mask_iters.div_up(k, new_obj.tile_shape[2])
+                gemm_k_iterations = mask_iters.div_up(total_gemm_k_iterations,
+                                                    new_obj.grid_dims.z)
+                new_obj.gemm_k_size = gemm_k_iterations * new_obj.tile_shape[2]
+                a_shape = [m, k]
+                b_shape = [k, n]
+                c_shape = [m, n // groups]
+            new_obj.tiles_per_k = tiles_per_k
+            new_obj.tiles_per_c = tiles_per_c
+            new_obj.k_per_group = k_per_group
+            new_obj.c_per_group = c_per_group
         new_obj.ptr_A = A
         new_obj.ptr_B = B
         new_obj.ptr_C = C
@@ -197,16 +326,16 @@ class GemmParams(pccm.ParameterizedClass):
         new_obj.k = k
         new_obj.alpha = alpha
         new_obj.beta = beta
-        a_stride = k
+        a_stride = a_shape[1]
         if self.trans_a:
-            a_stride = m
-        b_stride = n
+            a_stride = a_shape[0]
+        b_stride = b_shape[1]
         if self.trans_b:
-            b_stride = k
+            b_stride = b_shape[0]
 
         new_obj.itera_params_ = self.itera_params.python_ctor(a_stride)
         new_obj.iterb_params_ = self.iterb_params.python_ctor(b_stride)
-        new_obj.out_params_ = self.out_params.python_ctor(n)
+        new_obj.out_params_ = self.out_params.python_ctor(c_shape[1])
         return new_obj
 
     @pccm.cuda.constructor(host=True, device=True, inline=True)
@@ -227,6 +356,16 @@ class GemmParams(pccm.ParameterizedClass):
             grid_dims.y = grid_shape.n();
             grid_dims.z = grid_shape.k();
             """)
+        elif self.group_mode != ConvGroupMode.kNone:
+            assert not self.trans_c
+            code.raw(f"""
+                auto grid_dims_arr = GemmUtilsCPU::get_grouped_conv_gemm_logical_tile_count(m, n, k, groups, 
+                                            {self.tile_shape[0]}, {self.tile_shape[1]}, {self.tile_shape[2]}, split_k_slices,
+                                            {self.group_mode.value}, {self.conv_type.value});
+                grid_dims.x = grid_dims_arr[0];
+                grid_dims.y = grid_dims_arr[1];
+                grid_dims.z = grid_dims_arr[2];
+            """)
         else:
             code.raw(f"""
             auto grid_dims_arr = GemmUtilsCPU::get_logical_tile_count(m, n, k, {self.tile_shape[0]}, {self.tile_shape[1]}, split_k_slices);
@@ -235,15 +374,20 @@ class GemmParams(pccm.ParameterizedClass):
             grid_dims.y = grid_dims_arr[1];
             grid_dims.z = grid_dims_arr[2];
             """)
-        code.raw(f"""
-        // int total_gemm_k_iterations = tv::div_up(k, {self.tile_shape[2]}); // 160, 16 = 10
-        // int gemm_k_iterations_per_split =
-        //     tv::div_up(total_gemm_k_iterations, int(grid_dims.z)); // 10, 4 = 3
-        // gemm_k_size_per_split = gemm_k_iterations_per_split * {self.tile_shape[2]}; // 3 * 16 = 48, 0-48, 48-96, 96-144, 144-192
-        gemm_k_size_per_split = GemmUtils::get_gemm_k_size_per_split(k, split_k_slices);
+        if self.group_mode == ConvGroupMode.kNone:
+            code.raw(f"""
+            // int total_gemm_k_iterations = tv::div_up(k, {self.tile_shape[2]}); // 160, 16 = 10
+            // int gemm_k_iterations_per_split =
+            //     tv::div_up(total_gemm_k_iterations, int(grid_dims.z)); // 10, 4 = 3
+            // gemm_k_size_per_split = gemm_k_iterations_per_split * {self.tile_shape[2]}; // 3 * 16 = 48, 0-48, 48-96, 96-144, 144-192
+            gemm_k_size_per_split = GemmUtils::get_gemm_k_size_per_split(k, split_k_slices);
 
-        // tv::ssprint("gemm_k_size_per_split", m, n, k, gemm_k_size_per_split, grid_dims.x, grid_dims.y, grid_dims.z);
-        """)
+            // tv::ssprint("gemm_k_size_per_split", m, n, k, gemm_k_size_per_split, grid_dims.x, grid_dims.y, grid_dims.z);
+            """)
+        else:
+            code.raw(f"""
+                gemm_k_size_per_split = GemmUtils::get_grouped_conv_gemm_k_size_per_split(k, groups, split_k_slices, {self.group_mode.value}, {self.conv_type.value});
+            """)
         # if CUTLASS_INPUT_ITER:
         #     code.raw(f"""
         #     cutlass::layout::RowMajor layoutA({pccm.boolean(self.trans_a)} ? m : k);
@@ -328,6 +472,9 @@ class GemmParams(pccm.ParameterizedClass):
 
             
         code.arg("m, n, k", "int")
+        if self.group_mode != ConvGroupMode.kNone:
+            code.arg("groups", "int")
+            code.ctor_init("groups", "groups")
         code.arg("A", f"const {self.dtype_a}*")
         code.arg("B", f"const {self.dtype_b}*")
         code.arg("C", f"{self.dtype_c}*")
@@ -397,7 +544,8 @@ class GemmKernel(GemmComponentBase):
             access_per_vector: int = 1,
             nvrtc_mode: NVRTCMode = NVRTCMode.Disabled,
             async_kernel: bool = False,
-            split_d_params: bool = True):
+            split_d_params: bool = True,
+            group_mode: ConvGroupMode = ConvGroupMode.kNone):
         """
         splitK and sliceK:
         https://github.com/NVIDIA/cutlass/issues/211#issuecomment-801992218
@@ -423,6 +571,7 @@ class GemmKernel(GemmComponentBase):
         self.nvrtc_mode = nvrtc_mode
         self.async_kernel = async_kernel
         self.split_d_params = split_d_params
+        self.group_mode = group_mode
         transpose_gemm = trans_c
         if transpose_gemm:
             self.dtype_a = dtype_b
@@ -503,7 +652,9 @@ class GemmKernel(GemmComponentBase):
                                       inp_iter_a_param, inp_iter_b_param,
                                       self.output_spec.out_iter.get_params(),
                                       have_workspace, shuffle_stride,
-                                      split_d_params)
+                                      split_d_params, group_mode=self.group_mode)
+        if self.group_mode != ConvGroupMode.kNone:
+            self.conv_type = self.gemm_params.conv_type
         # self.add_dependency(GemmNVRTCParams)
         self.add_param_class("gemm_params", self.gemm_params, "GemmParams")
         self.add_code_before_class(f"""
@@ -572,6 +723,9 @@ class GemmKernel(GemmComponentBase):
             res += "0"
         if self.shuffle_stride != ShuffleStrideType.NoShuffle:
             res += f"_S{self.shuffle_stride.value}"
+        if self.group_mode != ConvGroupMode.kNone:
+            dit = {ConvGroupMode.kSingleGroup: 'S', ConvGroupMode.kMultipleGroup: "M", ConvGroupMode.kDeepwise: "D", ConvGroupMode.kSingleGroupUnaligned: "SU"}
+            res += f"_G{dit[self.group_mode]}"
         return res
 
     def support_splitk(self):
@@ -1059,11 +1213,88 @@ class GemmKernel(GemmComponentBase):
                              (tile_offset_k + 1) * params.gemm_k_size)
         gemm_k_iterations = mask_iters.div_up(
             problem_size_k - block_offset_A[1], self.tile_shape[2])
+        a_extent = [params.m, problem_size_k]
+        b_extent = [problem_size_k, params.n]
+        c_extent = [params.m, params.n]
+        if self.group_mode == ConvGroupMode.kSingleGroup:
+            if self.conv_type == ConvOpType.kForward:
+                group_idx = block_offset_B[1] // params.k_per_group
+                block_offset_A = seq(block_offset_A[0],
+                                    block_offset_A[1] + group_idx * params.c_per_group)
+                problem_size_k = min(params.c_per_group, (tile_offset_k + 1) * params.gemm_k_size)
+                gemm_k_iterations = mask_iters.div_up(problem_size_k, self.tile_shape[2])
+                a_extent = [params.m, params.k]
+                b_extent = [params.c_per_group, params.n]
+                c_extent = [params.m, params.n]
+            elif self.conv_type == ConvOpType.kBackwardInput:
+                group_idx = tile_offset_k
+                block_offset_C = seq(block_offset_C[0], block_offset_C[1] + params.c_per_group * group_idx)
+                # block_offset_A = seq(block_offset_A[0], block_offset_A[1] + params.k_per_group * group_idx)
+                # block_offset_B = seq(block_offset_B[0] + group_idx * params.k_per_group, block_offset_B[1])
+                tile_offset_k = 0           # dont want to modify too much below
+                problem_size_k = params.k_per_group
+                gemm_k_iterations = mask_iters.div_up(problem_size_k, self.tile_shape[2])
+                a_extent = [params.m, params.k_per_group * params.groups]
+                b_extent = [params.k_per_group * params.groups, params.n]
+                c_extent = [params.m, params.n * params.groups]
+
+            else:
+                group_idx = tile_offset_m * self.tile_shape[0] // params.k_per_group
+                block_offset_B = seq(block_offset_B[0], block_offset_B[1] + group_idx * params.c_per_group)
+                problem_size_k = min(params.k,
+                                    (tile_offset_k + 1) * params.gemm_k_size)
+                gemm_k_iterations = mask_iters.div_up(
+                    problem_size_k - block_offset_A[1], self.tile_shape[2])
+                a_extent = [params.m, params.k]
+                b_extent = [params.k, params.n]
+                c_extent = [params.m, params.c_per_group]
+        elif self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+            if self.conv_type == ConvOpType.kForward:
+                group_idx = tile_offset_n // params.tiles_per_k
+                block_offset_A = seq(block_offset_A[0],
+                                    block_offset_A[1] + group_idx * params.c_per_group)
+                group_idx_res = tile_offset_n % params.tiles_per_k
+
+                block_offset_B = seq(block_offset_B[0], group_idx * params.k_per_group + group_idx_res * params.tile_shape[1])
+                block_offset_C = seq(block_offset_C[0], group_idx * params.k_per_group + group_idx_res * params.tile_shape[1])
+                
+                problem_size_k = min(params.c_per_group, (tile_offset_k + 1) * params.gemm_k_size)
+                gemm_k_iterations = mask_iters.div_up(problem_size_k, self.tile_shape[2])
+                a_extent = [params.m, (group_idx + 1) * params.c_per_group]
+                b_extent = [params.c_per_group, (group_idx + 1) * params.k_per_group]
+                c_extent = [params.m, (group_idx + 1) * params.k_per_group]
+            elif self.conv_type == ConvOpType.kBackwardInput:
+                group_idx = tile_offset_k
+                block_offset_C = seq(block_offset_C[0], block_offset_C[1] + params.c_per_group * group_idx)
+                # block_offset_A = seq(block_offset_A[0], block_offset_A[1] + params.k_per_group * group_idx)
+                # block_offset_B = seq(block_offset_B[0] + group_idx * params.k_per_group, block_offset_B[1])
+                tile_offset_k = 0           # dont want to modify too much below
+                problem_size_k = params.k_per_group
+                gemm_k_iterations = mask_iters.div_up(problem_size_k, self.tile_shape[2])
+                a_extent = [params.m, params.k_per_group * (group_idx + 1)]
+                b_extent = [params.k_per_group * (group_idx + 1), params.n]
+                c_extent = [params.m, params.n * params.groups]
+
+            else:
+                group_idx = tile_offset_m // params.tiles_per_k
+                group_idx_res = tile_offset_m % params.tiles_per_k
+                block_offset_A = seq(group_idx * params.k_per_group + group_idx_res * params.tile_shape[0], block_offset_A[1])
+                block_offset_C = seq(block_offset_A[0], block_offset_C[1])
+                block_offset_B = seq(block_offset_B[0], block_offset_B[1] + group_idx * params.c_per_group)
+                problem_size_k = min(params.k,
+                                    (tile_offset_k + 1) * params.gemm_k_size)
+                gemm_k_iterations = mask_iters.div_up(
+                    problem_size_k - block_offset_A[1], self.tile_shape[2])
+                a_extent = [(group_idx + 1) * params.k_per_group, params.k]
+                b_extent = [params.k, (group_idx + 1) * params.c_per_group]
+                c_extent = [params.m, params.c_per_group]
+
+
         if self.trans_a:
-            extent_A = seq(problem_size_k, params.m)
+            extent_A = seq(a_extent[1], a_extent[0])
             tb_offset_A = seq(block_offset_A[1], block_offset_A[0])
         else:
-            extent_A = seq(params.m, problem_size_k)
+            extent_A = seq(a_extent[0], a_extent[1])
             tb_offset_A = seq(block_offset_A[0], block_offset_A[1])
 
         input_iter_A = self.input_spec.input_iter_a.python_ctor(
@@ -1074,10 +1305,10 @@ class GemmKernel(GemmComponentBase):
             tb_offset_A,
             is_left=True)
         if self.trans_b:
-            extent_B = seq(params.n, problem_size_k)
+            extent_B = seq(b_extent[1], b_extent[0])
             tb_offset_B = seq(block_offset_B[1], block_offset_B[0])
         else:
-            extent_B = seq(problem_size_k, params.n)
+            extent_B = seq(b_extent[0], b_extent[1])
             tb_offset_B = seq(block_offset_B[0], block_offset_B[1])
         input_iter_B = self.input_spec.input_iter_b.python_ctor(
             params.iterb_params_,
@@ -1115,10 +1346,10 @@ class GemmKernel(GemmComponentBase):
                 output_op.set_k_partition_python(tile_offset_k,
                                                  cudasim.gridDim().z)
         out_iter_C = self.output_spec.out_iter.python_ctor(
-            params.out_params_, params.ptr_C, seq(params.m, params.n),
+            params.out_params_, params.ptr_C, seq(c_extent[0], c_extent[1]),
             seq(block_offset_C[0], block_offset_C[1]), thread_idx)
         out_iter_D = self.output_spec.out_iter.python_ctor(
-            params.out_params_, params.ptr_D, seq(params.m, params.n),
+            params.out_params_, params.ptr_D, seq(c_extent[0], c_extent[1]),
             seq(block_offset_C[0], block_offset_C[1]), thread_idx)
         if self.splitk_serial and cudasim.gridDim().z > 1:
             if tile_offset_k > 0:

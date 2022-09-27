@@ -121,6 +121,12 @@ class TensorViewBind(pccm.Class, pccm.pybind.PybindClassMixin):
         py::enum_<tv::gemm::ConvIterAlgo>(module_, "ConvIterAlgo")
             .value("Analytic", tv::gemm::ConvIterAlgo::kAnalytic)
             .value("Optimized", tv::gemm::ConvIterAlgo::kOptimized);
+        py::enum_<tv::gemm::ConvGroupMode>(module_, "ConvGroupMode")
+            .value("kNone", tv::gemm::ConvGroupMode::kNone)
+            .value("kSingleGroup", tv::gemm::ConvGroupMode::kSingleGroup)
+            .value("kMultipleGroup", tv::gemm::ConvGroupMode::kMultipleGroup)
+            .value("kDeepwise", tv::gemm::ConvGroupMode::kDeepwise)
+            .value("kSingleGroupUnaligned", tv::gemm::ConvGroupMode::kSingleGroupUnaligned);
 
         py::enum_<tv::gemm::ConvLayoutType>(module_, "ConvLayoutType")
             .value("ChannelFirst", tv::gemm::ConvLayoutType::kChannelFirst)

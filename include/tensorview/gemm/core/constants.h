@@ -54,5 +54,13 @@ enum class Activation {
 
 };
 
+enum class ConvGroupMode {
+  kNone = 0,
+  kSingleGroup = 1,
+  kMultipleGroup = 2,
+  kDeepwise = 3,
+  kSingleGroupUnaligned = 4,
+};
+
 } // namespace gemm
 } // namespace tv

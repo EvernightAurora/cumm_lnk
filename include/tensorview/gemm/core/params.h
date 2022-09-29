@@ -305,14 +305,14 @@ struct ConvAlgoDesp : public GemmAlgoDesp {
           tiles_per_k = div_up(k_per_group, tile_shape[1]);
           break;
         case ConvOpType::kBackwardInput:
-          c_per_group = n / groups;
+          c_per_group = k / groups;
           k_per_group = k / kv / groups;
           tiles_per_k = div_up(k_per_group, tile_shape[2]);
           tiles_per_c = div_up(c_per_group, tile_shape[1]);
           break;
 
         case ConvOpType::kBackwardWeight:
-          c_per_group = k / kv / groups;
+          c_per_group = n / kv / groups;
           k_per_group = m / groups;
           tiles_per_c = div_up(c_per_group, tile_shape[1]);
           tiles_per_k = div_up(k_per_group, tile_shape[0]);

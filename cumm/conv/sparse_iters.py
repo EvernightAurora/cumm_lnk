@@ -25,7 +25,7 @@ from cumm import cudasim, dtypes
 from cumm.common import (GemmBasic, GemmBasicKernel, TensorView,
                          TensorViewMath, TensorViewNVRTC)
 from cumm.conv import bases, params
-from cumm.conv.bases import LAYOUT_TYPES, ConvMode, ConvOpType
+from cumm.conv.bases import LAYOUT_TYPES, ConvMode, ConvOpType, ConvGroupMode
 from cumm.gemm import codeops, constants, layout, thread_map
 from cumm.gemm.arch.memory import GlobalLoad
 from cumm.gemm.core import MetaArray, array_type, metaseq, seq
@@ -280,7 +280,8 @@ class ForwardDgradSparseIOIterator(bases.ConvInputIterator):
     @pccm.cuda.member_function(device=True, forceinline=True)
     def update_indices(self):
         code = pccm.cuda.PTXCode()
-        C_or_K = "C" if self.op_type == ConvOpType.kForward else "K"
+        Raw_or_not = "raw_" if self.problem_size.group_mode == ConvGroupMode.kSingleGroupUnaligned else ""
+        C_or_K = (Raw_or_not + "C") if self.op_type == ConvOpType.kForward else (Raw_or_not + "K")
         if self.is_wgrad_out:
             # if False:
             # wgrad out only need shuffle.
@@ -310,7 +311,7 @@ class ForwardDgradSparseIOIterator(bases.ConvInputIterator):
                 TV_PRAGMA_UNROLL
                 for (int ss = 0; ss < {self.sub_tile_shape[0]}; ++ss){{
                     indices_[s * {self.sub_tile_shape[0]} + ss] = indices_[s * {self.sub_tile_shape[0]} + ss] * 
-                            problem_.K * {self.dtype.nbytes_str()} ;
+                            problem_.{Raw_or_not}K * {self.dtype.nbytes_str()} ;
                 }}
             }}
             """)
@@ -340,7 +341,7 @@ class ForwardDgradSparseIOIterator(bases.ConvInputIterator):
                     # """)
 
             if self.is_wgrad_input:
-                C_or_K = "C"
+                C_or_K = Raw_or_not + "C"
             code.raw(f"""
             TV_PRAGMA_UNROLL
             for (int s = 0; s < {self.tmap.iterations[0]}; ++s){{
@@ -870,7 +871,8 @@ class ForwardDgradSparseIOIteratorV2Mask(bases.ConvInputIterator):
     @pccm.cuda.member_function(device=True, forceinline=True)
     def update_indices(self):
         code = pccm.cuda.PTXCode()
-        C_or_K = "C" if self.op_type == ConvOpType.kForward else "K"
+        Raw_or_not = "raw_" if self.problem_size.group_mode == ConvGroupMode.kSingleGroupUnaligned else ""
+        C_or_K = (Raw_or_not + "C") if self.op_type == ConvOpType.kForward else (Raw_or_not + "K")
         if self.is_wgrad_out:
             # if False:
             # wgrad out only need shuffle.
@@ -899,7 +901,7 @@ class ForwardDgradSparseIOIteratorV2Mask(bases.ConvInputIterator):
                 TV_PRAGMA_UNROLL
                 for (int ss = 0; ss < {self.sub_tile_shape[0]}; ++ss){{
                     indices_[s * {self.sub_tile_shape[0]} + ss] = indices_[s * {self.sub_tile_shape[0]} + ss] * 
-                            problem_.K * {self.dtype.nbytes_str()} ;
+                            problem_.{Raw_or_not}K * {self.dtype.nbytes_str()} ;
                 }}
             }}
             """)
@@ -925,7 +927,7 @@ class ForwardDgradSparseIOIteratorV2Mask(bases.ConvInputIterator):
                                 (s * self.tmap.delta[0] + ss) * 4,
                                 mask_ptr[s * self.sub_tile_shape[0] + ss])
             if self.is_wgrad_input:
-                C_or_K = "C"
+                C_or_K = f"{Raw_or_not}C"
             code.raw(f"""
             TV_PRAGMA_UNROLL
             for (int s = 0; s < {self.tmap.iterations[0]}; ++s){{

@@ -99,7 +99,7 @@ class GemmAlgoParams(object):
                 if (self.trans_a or not self.trans_b):
                     return True
         if self.group_mode != ConvGroupMode.kNone:
-            if self.trans_a and not self.trans_b:
+            if self.trans_a and self.trans_b:
                 return True
         return False
 

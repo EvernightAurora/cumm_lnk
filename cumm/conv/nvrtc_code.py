@@ -22,7 +22,7 @@ def nvrtc_conv_template(code: pccm.FunctionCode):
     // auto rtxtimer = tv::CPUTimer<>();
     // auto ev1 = tv::CUDAEvent("wtf").record();
     static_assert({CUMM_MAXIMUM_NVRTC_CONV_NDIM} == CUMM_MAXIMUM_NVRTC_CONV_NDIM, "error");
-    int groups = 1;
+    int groups = params.groups;
     bool found = false;
     auto& algo_desp = params.conv_algo_desp;
     auto dacc = tv::DType(algo_desp.dacc);
@@ -157,7 +157,7 @@ def nvrtc_conv_template(code: pccm.FunctionCode):
     }}
     TV_ASSERT_RT_ERR(algo_desp.supported(mnk[0], mnk[1], mnk[2], C, K, mask_width), "error");
 
-    int workspace_size = algo_desp.query_conv_workspace_size(mnk[0], mnk[1], mnk[2], split_k_slices, kernel_volume);
+    int workspace_size = algo_desp.query_conv_workspace_size(mnk[0], mnk[1], mnk[2], split_k_slices, kernel_volume, groups);
 
     auto ctx = tv::Context();
     ctx.set_cuda_stream(reinterpret_cast<cudaStream_t>(params.stream));

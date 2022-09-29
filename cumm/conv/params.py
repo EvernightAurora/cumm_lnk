@@ -24,6 +24,7 @@ from cumm.common import GemmBasic, GemmBasicKernel, TensorViewNVRTC
 from cumm.conv import bases
 from cumm.gemm import codeops, constants, layout, thread_map
 from cumm.gemm.core import MetaArray, array_type, metaseq, seq
+from cumm.conv.bases import ConvGroupMode
 
 
 def div_up(a: int, b: int) -> int:
@@ -159,7 +160,8 @@ class ConvProblem(pccm.ParameterizedClass):
                  layout_desp_input: bases.ConvLayout,
                  layout_desp_weight: bases.ConvLayout,
                  layout_desp_output: bases.ConvLayout,
-                 mask_sparse: bool = False):
+                 mask_sparse: bool = False,
+                 group_mode: ConvGroupMode = ConvGroupMode.kNone):
         super().__init__()
         self.add_dependency(ConvProblemCommon)
         self.ndim = ndim
@@ -168,6 +170,14 @@ class ConvProblem(pccm.ParameterizedClass):
         self.layout_desp_weight = layout_desp_weight
         self.layout_desp_output = layout_desp_output
         self.mask_sparse = mask_sparse
+        self.group_mode = group_mode
+        if self.group_mode != ConvGroupMode.kNone:
+            if self.group_mode == ConvGroupMode.kSingleGroup or self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+                self.add_member("C_per_group, K_per_group", f"int")
+                # if self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+                #     self.add_member("tiles_per_C, tiles_per_K", "int")
+            else:
+                raise NotImplementedError
         self.add_dependency(TensorViewNVRTC)
         # batch, input channel, output channel
         self.add_member("N, C, K", f"int")
@@ -180,6 +190,10 @@ class ConvProblem(pccm.ParameterizedClass):
             self.add_member("kernel_volume", f"int")
         self.add_member("mode", "tv::gemm::ConvMode")
         self.add_member("split_k_slices, groups", "int")
+
+        if self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+            self.add_member("raw_C, raw_K", "int")
+            
 
         # cudasim
         self.N_ = 0
@@ -213,9 +227,20 @@ class ConvProblem(pccm.ParameterizedClass):
         code.arg("mode", "tv::gemm::ConvMode", "tv::gemm::ConvMode::kCrossCorrelation")
         code.arg("split_k_slices", "int", "1")
         code.arg("groups", "int", "1")
-
+        
+        if self.group_mode in [ConvGroupMode.kSingleGroup, ConvGroupMode.kSingleGroupUnaligned]:
+            code.raw("""
+                C_per_group = C / groups;
+                K_per_group = K / groups;
+            """)
+            if self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+                code.raw("""
+                    raw_C = C;
+                    raw_K = K;
+                """)
         for arg in code.arguments:
-            code.ctor_init(arg.name, arg.name)
+            if arg.name[:4] != 'raw_':
+                code.ctor_init(arg.name, arg.name)
         return code
 
     def python_ctor(self, N: int, C: int, K: int, input_dims: List[int],
@@ -223,7 +248,7 @@ class ConvProblem(pccm.ParameterizedClass):
                     padding: List[int], stride: List[int], dilation: List[int],
                     mode: bases.ConvMode, split_k_slices: int, groups: int):
         new_obj = ConvProblem(self.ndim, self.op_type, self.layout_desp_input,
-                              self.layout_desp_weight, self.layout_desp_output)
+                              self.layout_desp_weight, self.layout_desp_output, group_mode=self.group_mode)
         new_obj.N_ = N
         new_obj.C_ = C
         new_obj.K_ = K
@@ -303,7 +328,25 @@ class ConvProblem(pccm.ParameterizedClass):
         code = pccm.code()
         code.arg("op_type", "tv::gemm::ConvOpType")
         code.arg("tile_shape_k", "int")
-        if self.mask_sparse:
+        if self.group_mode != ConvGroupMode.kNone:
+            if not self.mask_sparse:
+                raise NotImplementedError
+            if self.group_mode == ConvGroupMode.kSingleGroup or self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+                code.raw(f"""
+                switch (op_type) {{
+                    case tv::gemm::ConvOpType::kForward:
+                        return kernel_volume * tv::div_up(C_per_group, tile_shape_k);
+                    case tv::gemm::ConvOpType::kBackwardInput:
+                        return kernel_volume * tv::div_up(K_per_group, tile_shape_k);
+                    case tv::gemm::ConvOpType::kBackwardWeight:
+                        return tv::div_up(tv::div_up(N, split_k_slices), tile_shape_k);
+                    default:
+                        return 0;
+                }}
+                """)
+            else:
+                raise NotImplementedError
+        elif self.mask_sparse:
             code.raw(f"""
             switch (op_type) {{
                 case tv::gemm::ConvOpType::kForward:
@@ -344,6 +387,9 @@ class ConvProblem(pccm.ParameterizedClass):
         out_prod = int(np.prod(self.output_dims_))
         in_prod = int(np.prod(self.input_dims_))
 
+        if self.group_mode != ConvGroupMode.kNone:
+            raise NotImplementedError
+
         if conv_op_type == bases.ConvOpType.kForward:
             k_iters_in_C = codeops.div_up(self.C_, self.split_k_slices_)
             return ksize_prod * (codeops.div_up(k_iters_in_C, tile_shape_k))
@@ -365,9 +411,9 @@ class ConvProblem(pccm.ParameterizedClass):
 
     def get_weight_shape_python(self):
         if self.layout_desp_weight.is_channel_first():
-            return [self.K_, self.C_, *self.ksize_]
+            return [self.K_, self.C_ // self.groups_, *self.ksize_]
         else:
-            return [self.K_, *self.ksize_, self.C_]
+            return [self.K_, *self.ksize_, self.C_ // self.groups_]
 
     def get_output_shape_python(self):
         if self.layout_desp_output.is_channel_first():
@@ -397,11 +443,12 @@ class ConvProblem(pccm.ParameterizedClass):
             msg = "kernel_volume"
         else:
             msg = ", ".join(f"ksize[{i}]" for i in range(self.ndim))
+        C = 'C' if self.group_mode == ConvGroupMode.kNone else "C_per_group"
 
         if self.layout_desp_weight.is_channel_first():
-            code.raw(f"return {{K, C, {msg}}};")
+            code.raw(f"return {{K, {C}, {msg}}};")
         else:
-            code.raw(f"return {{K, {msg}, C}};")
+            code.raw(f"return {{K, {msg}, {C}}};")
         weight_ndim = 3 if self.mask_sparse else self.ndim + 2
 
         code.ret(f"tv::array<int, {weight_ndim}>")
@@ -449,3 +496,35 @@ class ConvProblem(pccm.ParameterizedClass):
 
     def get_gemm_trans_abc(self):
         return get_gemm_trans_abc(self.op_type)
+    
+    @pccm.member_function(header_only=True, attrs=["TV_HOST_DEVICE_INLINE"])
+    def as_new_C_K(self):
+        code = pccm.code()
+        code.arg("n_C, n_K", "int")
+        code.ret("ConvProblem")
+        code.raw("""
+            ConvProblem fake = *this;
+            fake.C = n_C;
+            fake.K = n_K;
+            return fake;
+        """)
+        return code
+    
+    @pccm.member_function(header_only=True, attrs=["TV_HOST_DEVICE_INLINE"], name="as_new_C_K")
+    def as_new_C_K_2(self):
+        code = pccm.code()
+        code.arg("n_C, n_K, m_C, m_K", "int")
+        code.ret("ConvProblem")
+        if self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+            code.raw("""
+                ConvProblem fake = *this;
+                fake.raw_C = n_C;
+                fake.raw_K = n_K;
+                fake.C = m_C;
+                fake.K = m_K;
+                return fake;
+            """)
+        else:
+            code.raw("assert(0);")
+        return code
+

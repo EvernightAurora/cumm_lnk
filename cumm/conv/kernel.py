@@ -30,7 +30,7 @@ from cumm.constants import CUMM_MAXIMUM_NVRTC_CONV_NDIM
 from cumm.conv import input_iters
 from cumm.conv.algospec import get_algo_spec
 from cumm.conv.bases import (LAYOUT_TYPES, ConvIterAlgo,
-                             ConvIterParams, ConvLayout, ConvOpType)
+                             ConvIterParams, ConvLayout, ConvOpType, ConvGroupMode)
 from cumm.conv.params import ConvProblem
 from cumm.core_cc.csrc.arrayref import ArrayPtr
 from cumm.gemm import (codeops, constants, gemmmath, layout, mask_iters,
@@ -76,6 +76,72 @@ class ConvUtils(pccm.Class):
         }}
         grid_dims[0] = tv::div_up(m, tile_m);
         grid_dims[2] = split_k_slices;
+        return grid_dims;
+        """)
+        return code
+    
+    @pccm.static_function(header_only=True, attrs=["TV_HOST_DEVICE_INLINE"])
+    def get_single_grouped_spconv_logical_tile_count(self):
+        code = pccm.code()
+        code.arg("m,n,k,tile_m, tile_n, split_k_slices, kv, op_type, groups, C_per_group, K_per_group", "const int&")
+        code.ret("tv::array<int, 3>")
+        code.raw(f"""
+        tv::array<int, 3> grid_dims;
+        switch (op_type){{
+            case {ConvOpType.kForward.value}:
+                grid_dims[0] = tv::div_up(m, tile_m);
+                grid_dims[1] = K_per_group / tile_n * groups;
+                grid_dims[2] = split_k_slices;                  // should be 1
+                break;
+
+            case {ConvOpType.kBackwardInput.value}:
+                grid_dims[0] = tv::div_up(m, tile_m);
+                grid_dims[1] = C_per_group / tile_n;
+                grid_dims[2] = groups;
+                break;
+            
+            case {ConvOpType.kBackwardWeight.value}:
+                grid_dims[0] = K_per_group / tile_m * groups;
+                grid_dims[1] = (C_per_group / tile_n) * kv;
+                grid_dims[2] = split_k_slices;
+                break;
+
+            default:
+                assert(0);
+        }}
+        return grid_dims;
+        """)
+        return code
+
+    @pccm.static_function(header_only=True, attrs=["TV_HOST_DEVICE_INLINE"])
+    def get_unaligned_single_grouped_spconv_logical_tile_count(self):        # biggest diff to aligned single group: tile_n may not divide C_per_group
+        code = pccm.code()
+        code.arg("m,n,k,tile_m, tile_n, split_k_slices, kv, op_type, groups, C_per_group, K_per_group, tiles_per_C, tiles_per_K", "const int&")
+        code.ret("tv::array<int, 3>")
+        code.raw(f"""
+        tv::array<int, 3> grid_dims;
+        switch (op_type){{
+            case {ConvOpType.kForward.value}:
+                grid_dims[0] = tv::div_up(m, tile_m);
+                grid_dims[1] = tiles_per_K * groups;
+                grid_dims[2] = split_k_slices;                  // should be 1
+                break;
+
+            case {ConvOpType.kBackwardInput.value}:
+                grid_dims[0] = tv::div_up(m, tile_m);
+                grid_dims[1] = tiles_per_C;
+                grid_dims[2] = groups;
+                break;
+            
+            case {ConvOpType.kBackwardWeight.value}:
+                grid_dims[0] = tiles_per_K * groups;
+                grid_dims[1] = tiles_per_C * kv;
+                grid_dims[2] = split_k_slices;
+                break;
+
+            default:
+                assert(0);
+        }}
         return grid_dims;
         """)
         return code
@@ -130,7 +196,8 @@ class ConvParams(pccm.ParameterizedClass):
                  have_workspace: bool = False,
                  mask_sparse: bool = False,
                  increment_k_first: bool = True,
-                 split_d_params: bool = False):
+                 split_d_params: bool = False,
+                 group_mode: ConvGroupMode = ConvGroupMode.kNone):
         super().__init__()
         self.add_dependency(TensorViewNVRTC, GemmBasic, ConvUtils,
                             GemmUtilsCPU)
@@ -161,6 +228,10 @@ class ConvParams(pccm.ParameterizedClass):
         self.dtype_b = dtype_b
         self.dtype_c = dtype_c
         self.dtype_comp = dtype_comp
+        self.group_mode = group_mode
+        if self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+            self.add_member("tiles_per_C, tiles_per_K", "int")
+            self.tiles_per_C = self.tiles_per_K = 0
 
         self.add_member("problem", "ConvProblem")
         # if mask_sparse and self.op_type == ConvOpType.kBackwardWeight:
@@ -230,6 +301,8 @@ class ConvParams(pccm.ParameterizedClass):
         m = mnk[0]
         n = mnk[1]
         k = mnk[2]
+        if self.group_mode != ConvGroupMode.kNone:
+            raise NotImplementedError
         new_obj.grid_dims.x = codeops.div_up(m, new_obj.tile_shape[0])
         new_obj.grid_dims.y = codeops.div_up(n, new_obj.tile_shape[1])
         new_obj.grid_dims.z = split_k_slices
@@ -301,6 +374,10 @@ class ConvParams(pccm.ParameterizedClass):
                 code.ctor_init("itera_params_",
                                "problem, indice_ptr, mask_argsort_ptr")
                 code.ctor_init("mask_out_ptr", "mask_out_ptr")
+
+                if self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+                    code.ctor_init("tiles_per_K", f"tv::div_up(problem.K_per_group, {self.tile_shape[1]})")
+                    code.ctor_init("tiles_per_C", f"tv::div_up(problem.C_per_group, {self.tile_shape[2]})")
             else:
                 code.ctor_init(
                     "itera_params_",
@@ -312,6 +389,9 @@ class ConvParams(pccm.ParameterizedClass):
             if self.mask_sparse:
                 code.ctor_init("itera_params_",
                                "problem, indice_ptr, mask_argsort_ptr")
+                if self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+                    code.ctor_init("tiles_per_C", f"tv::div_up(problem.C_per_group, {self.tile_shape[1]})")
+                    code.ctor_init("tiles_per_K", f"tv::div_up(problem.K_per_group, {self.tile_shape[2]})")
             else:
                 code.ctor_init(
                     "itera_params_",
@@ -325,6 +405,9 @@ class ConvParams(pccm.ParameterizedClass):
                                "problem, indice_ptr, mask_argsort_ptr")
                 code.ctor_init("iterb_params_",
                                "problem, indice_ptr, mask_argsort_ptr")
+                if self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+                    code.ctor_init("tiles_per_C", f"tv::div_up(problem.C_per_group, {self.tile_shape[1]})")
+                    code.ctor_init("tiles_per_K", f"tv::div_up(problem.K_per_group, {self.tile_shape[0]})")
             else:
                 code.ctor_init(
                     "itera_params_",
@@ -392,10 +475,25 @@ class ConvParams(pccm.ParameterizedClass):
                 #     f"TV_ASSERT_RT_ERR(problem.{C_or_K} % (split_k_slices * {self.tile_shape[2]}) == 0, \"error\");"
                 # )
         if self.mask_sparse:
-            code.raw(f"""
-            auto grid_dims_arr = ConvUtils::get_spconv_logical_tile_count(m, n, k, 
-                {self.tile_shape[0]}, {self.tile_shape[1]}, split_k_slices, problem.kernel_volume, {self.op_type.value});
-            """)
+            if self.group_mode == ConvGroupMode.kNone:
+                code.raw(f"""
+                auto grid_dims_arr = ConvUtils::get_spconv_logical_tile_count(m, n, k, 
+                    {self.tile_shape[0]}, {self.tile_shape[1]}, split_k_slices, problem.kernel_volume, {self.op_type.value});
+                """)
+            elif self.group_mode == ConvGroupMode.kSingleGroup:
+                code.raw(f"""
+                auto grid_dims_arr = ConvUtils::get_single_grouped_spconv_logical_tile_count(m, n, k, 
+                    {self.tile_shape[0]}, {self.tile_shape[1]}, split_k_slices, problem.kernel_volume, {self.op_type.value}, 
+                    problem.groups, problem.C_per_group, problem.K_per_group);
+                """)
+            elif self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+                code.raw(f"""
+                auto grid_dims_arr = ConvUtils::get_unaligned_single_grouped_spconv_logical_tile_count(m, n, k, 
+                    {self.tile_shape[0]}, {self.tile_shape[1]}, split_k_slices, problem.kernel_volume, {self.op_type.value}, 
+                    problem.groups, problem.C_per_group, problem.K_per_group, tiles_per_C, tiles_per_K);
+                """)
+            else:
+                raise NotImplementedError
         else:
             code.raw(f"""
             auto grid_dims_arr = GemmUtilsCPU::get_logical_tile_count(m, n, k, 
@@ -428,9 +526,13 @@ class ConvParams(pccm.ParameterizedClass):
             # code.raw(f"""
             # TV_THROW_RT_ERR("WTF");
             # """)
-            code.raw("out_params_ = OutIterParams(n);")
+            out_n = "n"
+            if self.op_type == ConvOpType.kBackwardWeight:
+                if self.group_mode == ConvGroupMode.kSingleGroup or self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+                    out_n = "problem.C_per_group * problem.kernel_volume"
+            code.raw(f"out_params_ = OutIterParams({out_n});")
             if self.split_d_params:
-                code.raw("out_params_d_ = d_is_bias ? OutIterParams(0) : OutIterParams(n);")
+                code.raw(f"out_params_d_ = d_is_bias ? OutIterParams(0) : OutIterParams({out_n});")
 
         return code
 
@@ -460,7 +562,8 @@ class ConvKernel(GemmComponentBase):
                  increment_k_first: bool = False,
                  access_per_vector: int = 1,
                  nvrtc_mode: NVRTCMode = NVRTCMode.Disabled,
-                 split_d_params: bool = True):
+                 split_d_params: bool = True,
+                 group_mode: ConvGroupMode = ConvGroupMode.kNone):
         """
         splitK and sliceK:
         https://github.com/NVIDIA/cutlass/issues/211#issuecomment-801992218
@@ -484,7 +587,7 @@ class ConvKernel(GemmComponentBase):
 
         problem = ConvProblem(ndim, op_type, layout_desp_input,
                               layout_desp_weight, layout_desp_output,
-                              mask_sparse)
+                              mask_sparse, group_mode=group_mode)
         self.problem = problem
         trans_a, trans_b, trans_c = problem.get_gemm_trans_abc()
         self.tile_shape = tile_shape
@@ -532,6 +635,7 @@ class ConvKernel(GemmComponentBase):
         self.input_spec = algo_spec.input_spec
         self.mma_spec = algo_spec.mma_spec
         self.output_spec = algo_spec.output_spec
+        self.group_mode = group_mode
 
         self.warp_count_shape = tile_shape // warp_tile_shape
         self.warp_count = self.warp_count_shape.prod()
@@ -583,7 +687,7 @@ class ConvKernel(GemmComponentBase):
             inp_iter_a_param, inp_iter_b_param,
             self.output_spec.out_iter.get_params(), have_workspace,
             mask_sparse, increment_k_first,
-            split_d_params)
+            split_d_params, group_mode=group_mode)
         self.add_param_class("conv_params", self.gemm_params, "ConvParams")
         self.add_param_class("conv_params", self.gemm_params.problem,
                              "ConvProblem")
@@ -680,6 +784,16 @@ class ConvKernel(GemmComponentBase):
         res += f"{self.problem.layout_desp_input}{self.problem.layout_desp_weight}{self.problem.layout_desp_output}"
         if self.mask_sparse:
             res += "_SF" if not self.increment_k_first else "_SK"
+        if self.group_mode != ConvGroupMode.kNone:
+            res += '_G'
+            if self.group_mode == ConvGroupMode.kSingleGroup:
+                res += 'S'
+            elif self.group_mode == ConvGroupMode.kMultipleGroup:
+                res += 'M'
+            elif self.group_mode == ConvGroupMode.kDeepwise:
+                res += 'D'
+            elif self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+                res += 'SU'
         return res
 
     @pccm.cuda.cuda_global_function  # (inline=True)
@@ -728,21 +842,146 @@ class ConvKernel(GemmComponentBase):
             k_offset = f"tile_offset_k * {self.tile_shape[2]}"
             m_offset = f"tile_offset_m * {self.tile_shape[0]}"
             n_offset = f"tile_offset_n * {self.tile_shape[1]}"
-            if self.trans_a:
-                a_offset = f"{k_offset}, {m_offset}"
-            else:
-                a_offset = f"{m_offset}, {k_offset}"
-            if self.trans_b:
-                b_offset = f"{n_offset}, {k_offset}"
-            else:
-                if self.mask_sparse and self.problem.op_type == ConvOpType.kBackwardWeight:
-                    code.raw(f"""
-                    int num_block_in_C = tv::div_up(params.problem.C, {self.tile_shape[1]});
-                    int block_offset_in_C = tile_offset_n % num_block_in_C;
-                    """)
-                    b_offset = f"{k_offset}, block_offset_in_C * {self.tile_shape[1]}"
+            
+            a_offset: str
+            b_offset: str
+            c_offset: str 
+            c_extent: str
+
+
+#############################################original group mode(no group)#######################################
+
+            if self.group_mode == ConvGroupMode.kNone:
+                code.raw("""
+                    const auto& problem_a = params.problem, &problem_b = params.problem; 
+                """)
+                if self.trans_a:
+                    a_offset = f"{k_offset}, {m_offset}"
                 else:
-                    b_offset = f"{k_offset}, {n_offset}"
+                    a_offset = f"{m_offset}, {k_offset}"
+                if self.trans_b:
+                    b_offset = f"{n_offset}, {k_offset}"
+                else:
+                    if self.mask_sparse and self.problem.op_type == ConvOpType.kBackwardWeight:
+                        code.raw(f"""
+                        int num_block_in_C = tv::div_up(params.problem.C, {self.tile_shape[1]});
+                        int block_offset_in_C = tile_offset_n % num_block_in_C;
+                        """)
+                        b_offset = f"{k_offset}, block_offset_in_C * {self.tile_shape[1]}"
+                    else:
+                        b_offset = f"{k_offset}, {n_offset}"
+                if self.mask_sparse and self.problem.op_type == ConvOpType.kBackwardWeight:         # todo: out offset
+                    c_offset = f"tile_offset_m * {self.tile_shape[0]}, filter_offset * params.problem.C + block_offset_in_C * {self.tile_shape[1]}"
+                    c_extent = f"params.m, filter_offset * params.problem.C + params.problem.C"
+                else:
+                    c_offset = f"tile_offset_m * {self.tile_shape[0]}, tile_offset_n * {self.tile_shape[1]}"
+                    c_extent = f"params.m, params.n"
+#############################################Singge group mode#######################################
+            elif self.group_mode == ConvGroupMode.kSingleGroup:
+                if not self.mask_sparse:
+                    raise NotImplementedError
+                code.raw("""
+                    ConvProblem problem_a, problem_b;
+                    // printf("problem C_pg %d K_pg %d gp %d \\n", params.problem.C_per_group, params.problem.K_per_group, params.problem.groups);
+
+                """)
+                if self.problem.op_type == ConvOpType.kForward:
+                    code.raw(f"""
+                        int group_idx = {n_offset} / params.problem.K_per_group;
+                        problem_a = params.problem;
+                        problem_b = params.problem.as_new_C_K(params.problem.C_per_group, params.problem.K);
+                        // printf("bx %d by %d bz %d g_id %d\\n", blockIdx.x, blockIdx.y, blockIdx.z, group_idx);
+                    """)
+                    a_offset = f"{m_offset}, {0} + group_idx * params.problem.C_per_group"
+                    b_offset = f"{n_offset}, {0}"
+                    c_offset = f"{m_offset}, {n_offset}"
+                    c_extent = f"params.m, params.n"
+                elif self.problem.op_type == ConvOpType.kBackwardInput:
+                    code.raw(f"""
+                        int group_idx = tile_offset_k;
+                        tile_offset_k = 0;
+                        problem_a = params.problem;
+                        problem_b = params.problem.as_new_C_K(params.problem.C_per_group, params.problem.K);
+                    """)
+                    a_offset = f"{m_offset}, group_idx * params.problem.K_per_group"
+                    b_offset = f"group_idx * params.problem.K_per_group, {n_offset}"
+                    k_offset = "0"
+                    c_offset = f"{m_offset}, {n_offset} + group_idx * params.problem.C_per_group"
+                    c_extent = f"params.m, params.n"
+                else:
+                    code.raw(f"""
+                        int group_idx = {m_offset} / params.problem.K_per_group;
+                        problem_a = params.problem;
+                        problem_b = params.problem;
+                        int num_block_in_C = tv::div_up(params.problem.C_per_group, {self.tile_shape[1]});
+                        int block_offset_in_C = tile_offset_n % num_block_in_C;
+                    """)
+                    a_offset = f"{k_offset}, {m_offset}"
+                    b_offset = f"{k_offset}, block_offset_in_C * {self.tile_shape[1]} + group_idx * params.problem.C_per_group"
+                    c_offset = f"tile_offset_m * {self.tile_shape[0]}, filter_offset * params.problem.C_per_group + block_offset_in_C * {self.tile_shape[1]}"
+                    c_extent = f"params.m, filter_offset * params.problem.C_per_group + params.problem.C_per_group"
+#############################################Unaligned Single group mode#######################################
+            elif self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
+                if not self.mask_sparse:
+                    raise NotImplementedError
+                code.raw("""
+                    ConvProblem problem_a, problem_b;
+                    // printf("problem tp_C %d tp_K %d gp %d \\n", params.tiles_per_C, params.tiles_per_K, params.problem.groups);
+
+                """)
+                if self.problem.op_type == ConvOpType.kForward:
+                    code.raw(f"""
+                        int group_idx = tile_offset_n / params.tiles_per_K;
+                        int group_residual = tile_offset_n - group_idx * params.tiles_per_K;
+                        problem_a = params.problem.as_new_C_K(params.problem.C, params.problem.K, 
+                                                                params.problem.C_per_group * (group_idx + 1), params.problem.K);
+                        problem_b = params.problem.as_new_C_K(params.problem.C_per_group, params.problem.K,
+                                                                params.problem.C_per_group, params.problem.K_per_group * (group_idx + 1));
+                        // printf("bx %d by %d bz %d g_id %d\\n", blockIdx.x, blockIdx.y, blockIdx.z, group_idx);
+                    """)
+                    
+                    n_offset = f"group_idx * params.problem.K_per_group + group_residual * {self.tile_shape[1]}"
+                    a_offset = f"{m_offset}, {0} + group_idx * params.problem.C_per_group"
+                    b_offset = f"{n_offset}, {0}"
+                    c_offset = f"{m_offset}, {n_offset}"
+                    c_extent = f"params.m, (group_idx + 1) * params.problem.K_per_group"
+                elif self.problem.op_type == ConvOpType.kBackwardInput:
+                    code.raw(f"""
+                        int group_idx = tile_offset_k;
+                        int group_residual = tile_offset_n;
+                        tile_offset_k = 0;
+                        problem_a = params.problem.as_new_C_K(params.problem.C, params.problem.K,
+                                                                params.problem.C, params.problem.K_per_group * (group_idx + 1));
+                        problem_b = params.problem.as_new_C_K(params.problem.C_per_group, params.problem.K,
+                                                                params.problem.C_per_group, params.problem.K_per_group * (group_idx + 1));
+                    """)
+                    n_offset = f"group_residual * {self.tile_shape[1]}"
+                    
+                    a_offset = f"{m_offset}, group_idx * params.problem.K_per_group"
+                    b_offset = f"group_idx * params.problem.K_per_group, {n_offset}"
+                    k_offset = "0"
+                    c_offset = f"{m_offset}, {n_offset} + group_idx * params.problem.C_per_group"
+                    c_extent = f"params.m, (group_idx + 1) * params.problem.C_per_group"
+                else:
+                    code.raw(f"""
+                        int group_idx = tile_offset_m / params.tiles_per_K;
+                        int group_residual = tile_offset_m - group_idx * params.tiles_per_K;
+                        problem_a = params.problem.as_new_C_K(params.problem.C, params.problem.K,
+                                                                params.problem.C, params.problem.K_per_group * (group_idx + 1));
+                        problem_b = params.problem.as_new_C_K(params.problem.C, params.problem.K,
+                                                                params.problem.C_per_group * (group_idx + 1), params.problem.K);
+                        int num_block_in_C = params.tiles_per_C;
+                        int block_offset_in_C = tile_offset_n % num_block_in_C;
+                    """)
+                    m_offset = f"group_idx * params.problem.K_per_group + group_residual * {self.tile_shape[0]}"
+        
+                    a_offset = f"{k_offset}, {m_offset}"
+                    b_offset = f"{k_offset}, block_offset_in_C * {self.tile_shape[1]} + group_idx * params.problem.C_per_group"
+                    c_offset = f"{m_offset}, filter_offset * params.problem.C_per_group + block_offset_in_C * {self.tile_shape[1]}"
+                    c_extent = f"params.problem.K_per_group * (group_idx + 1), filter_offset * params.problem.C_per_group + params.problem.C_per_group"
+            else:
+                raise NotImplementedError
+
             code.raw(f"""
             tv::array<int, 2> block_offset_A{{{a_offset}}};
             tv::array<int, 2> block_offset_B{{{b_offset}}};
@@ -752,11 +991,11 @@ class ConvKernel(GemmComponentBase):
             """)
             code.raw(f"""
             InputIteratorA input_iter_A(
-                params.itera_params_, params.problem, params.ptr_A,
+                params.itera_params_, problem_a, params.ptr_A,
                 thread_idx,
                 block_offset_A);
             InputIteratorB input_iter_B(
-                params.iterb_params_, params.problem, params.ptr_B,
+                params.iterb_params_, problem_b, params.ptr_B,
                 thread_idx,
                 block_offset_B);
             """)
@@ -819,13 +1058,21 @@ class ConvKernel(GemmComponentBase):
                         }}
                         """)
                 else:
-                    code.raw(f"""
-                    // uint32_t kmask = params.mask_ptr[(tv::div_up(params.problem.N, params.mask_width)) - 1];
-                    int filter_offset = tile_offset_n / tv::div_up(params.problem.C, {self.tile_shape[1]});
-                    if (!(params.mask_filter & (1 << filter_offset))){{
-                        return;
-                    }}
-                    """)
+                    if self.group_mode == ConvGroupMode.kNone:
+                        code.raw(f"""
+                        // uint32_t kmask = params.mask_ptr[(tv::div_up(params.problem.N, params.mask_width)) - 1];
+                        int filter_offset = tile_offset_n / tv::div_up(params.problem.C, {self.tile_shape[1]});
+                        if (!(params.mask_filter & (1 << filter_offset))){{
+                            return;
+                        }}
+                        """)
+                    else:
+                        code.raw(f"""
+                        int filter_offset = tile_offset_n / num_block_in_C;
+                        if (!(params.mask_filter & (1 << filter_offset))){{
+                            return;
+                        }}
+                        """)
             code.raw(f"""
             Mma mma(gemm_shared_mem, thread_idx, warp_idx_k, warp_m, warp_n, lane_idx);
             {self.fragment_c_t} accumulators;
@@ -876,18 +1123,12 @@ class ConvKernel(GemmComponentBase):
                     output_op.set_k_partition(tile_offset_k, params.grid_dims.z);
                 }}
                 """)
-            if self.mask_sparse and self.problem.op_type == ConvOpType.kBackwardWeight:
-                code.raw(f"""
-                tv::array<int, 2> block_offset_C{{tile_offset_m * {self.tile_shape[0]},
-                                                filter_offset * params.problem.C + block_offset_in_C * {self.tile_shape[1]}}};
-                tv::array<int, 2> block_extent_C{{params.m, filter_offset * params.problem.C + params.problem.C}};
-                """)
-            else:
-                code.raw(f"""
-                tv::array<int, 2> block_offset_C{{tile_offset_m * {self.tile_shape[0]},
-                                                tile_offset_n * {self.tile_shape[1]}}};
-                tv::array<int, 2> block_extent_C{{params.m, params.n}};
-                """)
+
+            code.raw(f"""
+            tv::array<int, 2> block_offset_C{{{c_offset}}};
+            tv::array<int, 2> block_extent_C{{{c_extent}}};
+            """)
+
             code.raw(f"""
             OutIter out_iter_C(params.out_params_, params.ptr_C, block_extent_C,
                                     block_offset_C,

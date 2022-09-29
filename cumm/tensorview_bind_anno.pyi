@@ -514,6 +514,13 @@ class Activation(Enum):
   Sigmoid = 2
   LeakyReLU = 3
 
+class ConvGroupMode(Enum):
+  kNone = 0
+  kSingleGroup = 1        
+  kMultipleGroup = 2 
+  kDeepwise = 3  
+  kSingleGroupUnaligned = 4
+
 #   Tanh = 3
 #   ELU = 5
 #   SeLU = 6
@@ -672,6 +679,7 @@ class ConvAlgoDesp(GemmAlgoDesp):
     interleave_o: int
     mask_sparse: bool
     increment_k_first: bool
+    group_mode: ConvGroupMode
 
     def copy(self) -> "ConvAlgoDesp":
         ...
@@ -854,6 +862,7 @@ class ConvParams:
     stream: int
     nvrtc_params: NVRTCParams
     bias: Tensor = Tensor()
+    groups: int = 1
 
     def __init__(
         self,

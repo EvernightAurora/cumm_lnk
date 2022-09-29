@@ -60,6 +60,66 @@ get_spconv_logical_tile_count(int m, int n, int k, int tile_m, int tile_n,
 }
 
 TV_HOST_DEVICE_INLINE tv::array<int, 3>
+get_single_grouped_spconv_logical_tile_count(int m, int n, int k, int tile_m, int tile_n,
+                              int split_k_slices, int kv, ConvOpType op_type,
+                              int groups, int C_per_group, int K_per_group) {
+  tv::array<int, 3> grid_dims;
+  switch (op_type){
+      case ConvOpType::kForward:
+          grid_dims[0] = tv::div_up(m, tile_m);
+          grid_dims[1] = K_per_group / tile_n * groups;
+          grid_dims[2] = split_k_slices;                  // should be 1
+          break;
+
+      case ConvOpType::kBackwardInput:
+          grid_dims[0] = tv::div_up(m, tile_m);
+          grid_dims[1] = C_per_group / tile_n;
+          grid_dims[2] = groups;
+          break;
+      
+      case ConvOpType::kBackwardWeight:
+          grid_dims[0] = K_per_group / tile_m * groups;
+          grid_dims[1] = (C_per_group / tile_n) * kv;
+          grid_dims[2] = split_k_slices;
+          break;
+      default:
+          assert(0);
+  }
+  return grid_dims;
+}
+
+TV_HOST_DEVICE_INLINE tv::array<int, 3>
+get_unaligned_single_grouped_spconv_logical_tile_count(int m, int n, int k, int tile_m, int tile_n,
+                              int split_k_slices, int kv, ConvOpType op_type,
+                              int groups, int C_per_group, int K_per_group,
+                              int tiles_per_C, int tiles_per_K) {
+  tv::array<int, 3> grid_dims;
+  switch (op_type){
+      case ConvOpType::kForward:
+          grid_dims[0] = tv::div_up(m, tile_m);
+          grid_dims[1] = tiles_per_K * groups;
+          grid_dims[2] = split_k_slices;                  // should be 1
+          break;
+
+      case ConvOpType::kBackwardInput:
+          grid_dims[0] = tv::div_up(m, tile_m);
+          grid_dims[1] = tiles_per_C;
+          grid_dims[2] = groups;
+          break;
+      
+      case ConvOpType::kBackwardWeight:
+          grid_dims[0] = tiles_per_K * groups;
+          grid_dims[1] = tiles_per_C * kv;
+          grid_dims[2] = split_k_slices;
+          break;
+      default:
+          assert(0);
+  }
+  return grid_dims;
+}
+
+
+TV_HOST_DEVICE_INLINE tv::array<int, 3>
 implicit_gemm_mnk(tv::gemm::ConvOpType op_type, int N, int C, int K,
                   int kernel_volume, int in_prod, int out_prod,
                   bool mask_sparse) {

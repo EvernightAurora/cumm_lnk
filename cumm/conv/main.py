@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import codeop
 import os
 import sys
 from functools import partial
@@ -31,7 +32,7 @@ from cumm.common import CummNVRTCLib, GemmBasic, GemmBasicHost, TensorView, Tens
 from cumm.constants import CUMM_MAXIMUM_NVRTC_CONV_NDIM, CUTLASS_MODE
 from cumm.conv import kernel
 from cumm.conv.bases import (NCHW, NHWC, ConvIterAlgo, ConvLayout,
-                             ConvLayoutType, ConvMode, ConvOpType)
+                             ConvLayoutType, ConvMode, ConvOpType, ConvGroupMode)
 from cumm.conv.params import (ConvProblem,
                               conv_iwo_012_to_abc, gemm_abc_012_to_iwo,
                               get_gemm_trans_abc)
@@ -67,7 +68,8 @@ class ConvAlgoParams(GemmAlgoParams):
                  mask_sparse: bool = False,
                  increment_k_first: bool = False,
                  access_per_vector: int = 1,
-                 is_nvrtc: bool = False):
+                 is_nvrtc: bool = False,
+                 group_mode: ConvGroupMode = ConvGroupMode.kNone):
         trans_a, trans_b, trans_c = get_gemm_trans_abc(op_type)
         super().__init__(ts,
                          wts,
@@ -81,7 +83,8 @@ class ConvAlgoParams(GemmAlgoParams):
                          splitk_serial,
                          splitk_parallel,
                          access_per_vector=access_per_vector,
-                         is_nvrtc=is_nvrtc)
+                         is_nvrtc=is_nvrtc,
+                         group_mode=group_mode)
         self.ndim = ndim
         self.op_type = op_type
         self.iter_algo = iter_algo
@@ -102,6 +105,10 @@ class ConvAlgoParams(GemmAlgoParams):
         if self.op_type != ConvOpType.kForward and self.dtype_a.itemsize(
         ) == 1:
             return True
+        if self.group_mode != ConvGroupMode.kNone:
+            if self.op_type != ConvOpType.kBackwardWeight:
+                if self.splitk_parallel or self.splitk_serial:
+                    return True
 
         return super().skipped()
 
@@ -123,7 +130,8 @@ def gen_gemm_params(op_types: List[ConvOpType],
                     mask_sparse: bool = False,
                     increment_k_first: bool = False,
                     access_per_vector: int = 1,
-                    is_nvrtc: bool = False):
+                    is_nvrtc: bool = False,
+                    group_mode: ConvGroupMode = ConvGroupMode.kNone):
     res: List[ConvAlgoParams] = []
     if not isinstance(dtypes_string, list):
         dtypes_string = [dtypes_string]
@@ -140,13 +148,13 @@ def gen_gemm_params(op_types: List[ConvOpType],
                                     dts, li, lw, lo, algo, tensorop, True,
                                     splitk_parallel, mask_sparse,
                                     increment_k_first, access_per_vector,
-                                    is_nvrtc=is_nvrtc)
+                                    is_nvrtc=is_nvrtc, group_mode=group_mode)
                 else:
                     p = ConvAlgoParams(ndim, op_type, iter_algo, ts, wts, num_stage,
                                     dts, li, lw, lo, algo, tensorop,
                                     splitk_serial, splitk_parallel, mask_sparse,
                                     increment_k_first, access_per_vector,
-                                    is_nvrtc=is_nvrtc)
+                                    is_nvrtc=is_nvrtc, group_mode=group_mode)
 
                 if not p.skipped():
                     res.append(p)
@@ -208,7 +216,8 @@ def gen_gemm_kernels(params: ConvAlgoParams,
                              mask_sparse=params.mask_sparse,
                              increment_k_first=params.increment_k_first,
                              access_per_vector=params.access_per_vector,
-                             nvrtc_mode=nvrtc_mode)
+                             nvrtc_mode=nvrtc_mode,
+                             group_mode=params.group_mode)
 
 
 SHUFFLE_SIMT_PARAMS = []
@@ -362,6 +371,10 @@ class ConvMainUnitTest(pccm.ParameterizedClass):
         return (ker.mask_sparse, ker.increment_k_first)
 
     @staticmethod
+    def _get_group_mode(ker: kernel.ConvKernel):
+        return (ker.group_mode, )
+
+    @staticmethod
     def conv_select_helper_stage1(kernels: List[kernel.ConvKernel],
                                   code: pccm.FunctionCode):
         ndim_op_iter_to_kers = codeops.group_by(
@@ -399,15 +412,24 @@ class ConvMainUnitTest(pccm.ParameterizedClass):
                                     liilwiloi_kers)
                                 for ms_ikf_mw, ms_ikf_mw_kers in ms_ikf_mw_to_kers.items(
                                 ):
-                                    assert len(
-                                        ms_ikf_mw_kers
-                                    ) == 1, "find multiple kernels for one configuration"
                                     if_tests = [
                                         f"algo_desp.mask_sparse == {pccm.boolean(ms_ikf_mw[0])}",
                                         f"algo_desp.increment_k_first == {pccm.boolean(ms_ikf_mw[1])}",
                                     ]
                                     with code.if_(" && ".join(if_tests)):
-                                        yield ms_ikf_mw_kers
+                                        conv_grouped_mode_kers = codeops.group_by(
+                                            ConvMainUnitTest._get_group_mode,
+                                            ms_ikf_mw_kers)
+                                        for conv_group_mode, conv_group_mode_kers in conv_grouped_mode_kers.items(
+                                        ):
+                                            assert len(
+                                                conv_group_mode_kers
+                                            ) == 1, "find multiple kernels for one configuration"
+                                            if_tests = [
+                                                f"int(algo_desp.group_mode) == {conv_group_mode[0].value}"
+                                            ]
+                                            with code.if_(" && ".join(if_tests)):
+                                                yield conv_group_mode_kers
 
     @staticmethod
     def conv_select_helper(kernels: List[Union[kernel.ConvKernel]],
@@ -922,6 +944,7 @@ class ConvMainUnitTest(pccm.ParameterizedClass):
             desp.trans_c_set({pccm.boolean(ker.trans_c)});
             desp.tile_shape = {{{ker.tile_shape[0]}, {ker.tile_shape[1]}, {ker.tile_shape[2]}}};
             desp.warp_tile_shape = {{{ker.warp_tile_shape[0]}, {ker.warp_tile_shape[1]}, {ker.warp_tile_shape[2]}}};
+            desp.group_mode = tv::gemm::ConvGroupMode({ker.group_mode.value});
             """)
             if ker.tensorop is not None:
                 code.raw(

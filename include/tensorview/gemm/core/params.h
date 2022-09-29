@@ -177,6 +177,7 @@ struct ConvAlgoDesp : public GemmAlgoDesp {
   bool increment_k_first = false;
   std::array<int, 3> conv2gemm_inds;
   std::array<int, 3> gemm2conv_inds;
+  ConvGroupMode group_mode;
   ConvAlgoDesp(int ndim, ConvOpType op_type)
       : GemmAlgoDesp(), ndim(ndim), op_type(op_type),
         iter_algo(ConvIterAlgo::kOptimized),
@@ -185,7 +186,8 @@ struct ConvAlgoDesp : public GemmAlgoDesp {
         layout_o(ConvLayoutType::kChannelLast), interleave_i(1),
         interleave_w(1), interleave_o(1),
         conv2gemm_inds(conv_iwo_012_to_abc(op_type)),
-        gemm2conv_inds(gemm_abc_012_to_iwo(op_type)) {}
+        gemm2conv_inds(gemm_abc_012_to_iwo(op_type)),
+        group_mode(ConvGroupMode::kNone) {}
   std::string __repr__() {
 
     check_valid();
@@ -211,6 +213,23 @@ struct ConvAlgoDesp : public GemmAlgoDesp {
     ss << layout_i_str << layout_w_str << layout_o_str;
     if (mask_sparse) {
       ss << "_" << (increment_k_first ? "SK" : "SF");
+    }
+    if (group_mode != ConvGroupMode::kNone) {
+      ss << "_G";
+      switch (group_mode) {
+        case ConvGroupMode::kSingleGroup:
+          ss<<"S";
+          break;
+        case ConvGroupMode::kDeepwise:
+          ss<<"D";
+          break;
+        case ConvGroupMode::kMultipleGroup:
+          ss<<"M";
+          break;
+        case ConvGroupMode::kSingleGroupUnaligned:
+          ss<<"SU";
+          break;
+      }
     }
     return ss.str();
   }
@@ -275,14 +294,57 @@ struct ConvAlgoDesp : public GemmAlgoDesp {
     }
     return res;
   }
+
+  void get_ck_per_group(int m, int n, int k, int kv, int groups, int&c_per_group, int&k_per_group, int&tiles_per_c, int&tiles_per_k){
+    if (group_mode == ConvGroupMode::kSingleGroup || group_mode == ConvGroupMode::kSingleGroupUnaligned){
+      switch (op_type){
+        case ConvOpType::kForward:
+          c_per_group = (k / kv) / groups;
+          k_per_group = (n / groups);
+          tiles_per_c = div_up(c_per_group, tile_shape[2]);
+          tiles_per_k = div_up(k_per_group, tile_shape[1]);
+          break;
+        case ConvOpType::kBackwardInput:
+          c_per_group = n / groups;
+          k_per_group = k / kv / groups;
+          tiles_per_k = div_up(k_per_group, tile_shape[2]);
+          tiles_per_c = div_up(c_per_group, tile_shape[1]);
+          break;
+
+        case ConvOpType::kBackwardWeight:
+          c_per_group = k / kv / groups;
+          k_per_group = m / groups;
+          tiles_per_c = div_up(c_per_group, tile_shape[1]);
+          tiles_per_k = div_up(k_per_group, tile_shape[0]);
+          break;
+      }
+    } else
+      assert(0);
+  }
+
   int query_conv_workspace_size(int m, int n, int k, int split_k_slices,
-                                int kv) {
+                                int kv, int groups=1) {
 
     if (!mask_sparse) {
       return query_workspace_size(m, n, k, split_k_slices);
     }
-    auto logical_tile_count = get_spconv_logical_tile_count(
-        m, n, k, tile_shape[0], tile_shape[1], split_k_slices, kv, op_type);
+    tv::array<int, 3> logical_tile_count;
+    if (group_mode == ConvGroupMode::kNone)
+      logical_tile_count = get_spconv_logical_tile_count(
+          m, n, k, tile_shape[0], tile_shape[1], split_k_slices, kv, op_type);
+    else{{
+      if (group_mode == ConvGroupMode::kSingleGroup || group_mode == ConvGroupMode::kSingleGroupUnaligned){
+        int C_per_group, K_per_group, tiles_per_C, tiles_per_K;
+        get_ck_per_group(m, n, k, kv, groups, C_per_group, K_per_group, tiles_per_C, tiles_per_K);
+        if (group_mode == ConvGroupMode::kSingleGroup)
+          logical_tile_count = get_single_grouped_spconv_logical_tile_count(m, n, k, tile_shape[0], tile_shape[1], split_k_slices, kv,
+                                                                            op_type, groups, C_per_group, K_per_group);
+        else
+          logical_tile_count = get_unaligned_single_grouped_spconv_logical_tile_count(m, n, k, tile_shape[0], tile_shape[1], split_k_slices, kv,
+                                                                                      op_type, groups, C_per_group, K_per_group,
+                                                                                      tiles_per_C, tiles_per_K);  
+      }
+    }}
     int workspace_size = 0;
     if (split_k_slices > 1) {
       if (split_k_serial()) {
@@ -315,6 +377,20 @@ struct ConvAlgoDesp : public GemmAlgoDesp {
       res &= ldo % epa_o == 0;
     }
     return res;
+  }
+  bool support_grouped(int C_per_group, int K_per_group){
+    if (group_mode == ConvGroupMode::kSingleGroupUnaligned)
+      return true;
+    if (group_mode == ConvGroupMode::kSingleGroup) {
+      switch (op_type) {
+        case ConvOpType::kForward:
+          return C_per_group % tile_shape[2] == 0 && K_per_group % tile_shape[1] == 0;
+        case ConvOpType::kBackwardInput:
+          return K_per_group % tile_shape[2] == 0 && C_per_group % tile_shape[1] == 0;
+        case ConvOpType::kBackwardWeight:
+          return K_per_group % tile_shape[0] == 0 && C_per_group % tile_shape[1] == 0;
+      }
+    }
   }
 };
 
@@ -407,12 +483,13 @@ struct ConvParams {
   tv::Tensor mask_output = tv::Tensor();
   std::uintptr_t stream = 0;
   tv::gemm::NVRTCParams nvrtc_params = tv::gemm::NVRTCParams();
+  int groups;
   ConvParams(int ndim, ConvOpType op_type, tv::CUDAKernelTimer timer)
       : conv_algo_desp(ndim, op_type), input(tv::Tensor()),
         weight(tv::Tensor()), output(tv::Tensor()), padding(std::vector<int>()),
         stride(std::vector<int>()), dilation(std::vector<int>()), alpha(1.0),
         beta(0.0), mask_width(-1), mask_filter(0xffffffff), reverse_mask(false),
-        verbose(false), timer(timer) {}
+        verbose(false), timer(timer), groups(1) {}
 };
 
 } // namespace gemm

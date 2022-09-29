@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from cumm.core_cc.tensorview_bind import (NVRTCParams, GemmAlgoDesp,
-                                          ConvAlgoDesp, ConvParams, ConvOpType,
+                                          ConvAlgoDesp, ConvParams, ConvOpType, ConvGroupMode, 
                                           ConvLayoutType, ShuffleStrideType,
                                           ConvIterAlgo, Activation,
                                           ConvMode, run_nvrtc_conv_kernel,

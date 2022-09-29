@@ -183,6 +183,7 @@ class ConvAlgoDesp(GemmAlgoDesp):
         }}
         auto logical_tile_count = tv::gemm::get_spconv_logical_tile_count(m, n, k, 
             tile_shape[0], tile_shape[1], split_k_slices, kv, op_type);
+        assert(0);
         int workspace_size = 0;
         if (split_k_slices > 1){{
             if (split_k_serial()){{
@@ -265,6 +266,7 @@ class ConvParams(pccm.Class, pccm.pybind.PybindClassMixin):
                                pyanno="cumm.tensorview.Tensor = Tensor()")
         self.add_pybind_member("stream", "std::uintptr_t", "0", pyanno="int")
         self.add_pybind_member("nvrtc_params", "tv::gemm::NVRTCParams", "tv::gemm::NVRTCParams()")
+        self.add_pybind_member("groups", "int")
 
 
     @pccm.pybind.mark
@@ -293,6 +295,7 @@ class ConvParams(pccm.Class, pccm.pybind.PybindClassMixin):
         code.ctor_init("reverse_mask", "false")
         code.ctor_init("verbose", "false")
         code.ctor_init("timer", "timer")
+        code.ctor_init("groups", "1")
 
         return code
 @pccm.pybind.bind_class_module_local

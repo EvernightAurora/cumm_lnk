@@ -293,12 +293,17 @@ class TensorViewBind(pccm.Class, pccm.pybind.PybindClassMixin):
         m_cls.def("query_conv_workspace_size",
                   &tv::gemm::ConvAlgoDesp::query_conv_workspace_size,
                   pybind11::arg("m"), pybind11::arg("n"), pybind11::arg("k"),
-                  pybind11::arg("split_k_slices"), pybind11::arg("kv"),
+                  pybind11::arg("split_k_slices"), pybind11::arg("kv"), pybind11::arg("groups"),
                   pybind11::return_value_policy::automatic);
         m_cls.def("supported_ldx_conv",
                   &tv::gemm::ConvAlgoDesp::supported_ldx_conv,
                   pybind11::arg("ldi"), pybind11::arg("ldw"), pybind11::arg("ldo"),
                   pybind11::return_value_policy::automatic);
+        m_cls.def("support_grouped",
+                  &tv::gemm::ConvAlgoDesp::support_grouped,
+                  pybind11::arg("C_per_group"), pybind11::arg("K_per_group"),
+                  pybind11::return_value_policy::automatic);
+        
         m_cls.def_readwrite("ndim", &tv::gemm::ConvAlgoDesp::ndim);
         m_cls.def_readwrite("op_type", &tv::gemm::ConvAlgoDesp::op_type);
         m_cls.def_readwrite("iter_algo",
@@ -316,6 +321,8 @@ class TensorViewBind(pccm.Class, pccm.pybind.PybindClassMixin):
                             &tv::gemm::ConvAlgoDesp::mask_sparse);
         m_cls.def_readwrite("increment_k_first",
                             &tv::gemm::ConvAlgoDesp::increment_k_first);
+        m_cls.def_readwrite("group_mode",
+                            &tv::gemm::ConvAlgoDesp::group_mode);
 
         """)
         return code
@@ -358,6 +365,7 @@ class TensorViewBind(pccm.Class, pccm.pybind.PybindClassMixin):
         m_cls.def_readwrite("stream", &tv::gemm::ConvParams::stream);
         m_cls.def_readwrite("nvrtc_params", &tv::gemm::ConvParams::nvrtc_params);
         m_cls.def_readwrite("bias", &tv::gemm::ConvParams::bias);
+        m_cls.def_readwrite("groups", &tv::gemm::ConvParams::groups);
 
         """)
         return code

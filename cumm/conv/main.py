@@ -18,6 +18,7 @@ import os
 import sys
 from functools import partial
 from pathlib import Path
+from tokenize import group
 from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -131,7 +132,7 @@ def gen_gemm_params(op_types: List[ConvOpType],
                     increment_k_first: bool = False,
                     access_per_vector: int = 1,
                     is_nvrtc: bool = False,
-                    group_mode: ConvGroupMode = ConvGroupMode.kNone):
+                    group_mode: Union[ConvGroupMode, List[ConvGroupMode]] = ConvGroupMode.kNone):
     res: List[ConvAlgoParams] = []
     if not isinstance(dtypes_string, list):
         dtypes_string = [dtypes_string]
@@ -140,24 +141,30 @@ def gen_gemm_params(op_types: List[ConvOpType],
         stages.extend(stage)
     else:
         stages.append(stage)
+    group_modes: List[ConvGroupMode] = []
+    if isinstance(group_mode, list):
+        group_modes.extend(group_mode)
+    else:
+        group_modes.append(group_mode)
     for dts in dtypes_string:
         for op_type in op_types:
             for num_stage in stages:
-                if op_type == ConvOpType.kBackwardWeight:
-                    p = ConvAlgoParams(ndim, op_type, iter_algo, ts, wts, num_stage,
-                                    dts, li, lw, lo, algo, tensorop, True,
-                                    splitk_parallel, mask_sparse,
-                                    increment_k_first, access_per_vector,
-                                    is_nvrtc=is_nvrtc, group_mode=group_mode)
-                else:
-                    p = ConvAlgoParams(ndim, op_type, iter_algo, ts, wts, num_stage,
-                                    dts, li, lw, lo, algo, tensorop,
-                                    splitk_serial, splitk_parallel, mask_sparse,
-                                    increment_k_first, access_per_vector,
-                                    is_nvrtc=is_nvrtc, group_mode=group_mode)
+                for group_mod in group_modes:
+                    if op_type == ConvOpType.kBackwardWeight:
+                        p = ConvAlgoParams(ndim, op_type, iter_algo, ts, wts, num_stage,
+                                        dts, li, lw, lo, algo, tensorop, True,
+                                        splitk_parallel, mask_sparse,
+                                        increment_k_first, access_per_vector,
+                                        is_nvrtc=is_nvrtc, group_mode=group_mod)
+                    else:
+                        p = ConvAlgoParams(ndim, op_type, iter_algo, ts, wts, num_stage,
+                                        dts, li, lw, lo, algo, tensorop,
+                                        splitk_serial, splitk_parallel, mask_sparse,
+                                        increment_k_first, access_per_vector,
+                                        is_nvrtc=is_nvrtc, group_mode=group_mod)
 
-                if not p.skipped():
-                    res.append(p)
+                    if not p.skipped():
+                        res.append(p)
     return res
 
 
@@ -168,6 +175,8 @@ ConvBwdWeight = [ConvOpType.kBackwardWeight]
 ConvAllOp = [
     ConvOpType.kForward, ConvOpType.kBackwardInput, ConvOpType.kBackwardWeight
 ]
+
+ConvSingleGroupedMode = [ConvGroupMode.kSingleGroup, ConvGroupMode.kSingleGroupUnaligned]
 
 
 def gen_spwgrad_params(ts,

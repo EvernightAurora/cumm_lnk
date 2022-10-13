@@ -220,7 +220,7 @@ struct ConvAlgoDesp : public GemmAlgoDesp {
         case ConvGroupMode::kSingleGroup:
           ss<<"S";
           break;
-        case ConvGroupMode::kDeepwise:
+        case ConvGroupMode::kDepthwise:
           ss<<"D";
           break;
         case ConvGroupMode::kMultipleGroup:
@@ -332,7 +332,7 @@ struct ConvAlgoDesp : public GemmAlgoDesp {
     if (group_mode == ConvGroupMode::kNone)
       logical_tile_count = get_spconv_logical_tile_count(
           m, n, k, tile_shape[0], tile_shape[1], split_k_slices, kv, op_type);
-    else{{
+    else{
       if (group_mode == ConvGroupMode::kSingleGroup || group_mode == ConvGroupMode::kSingleGroupUnaligned){
         int C_per_group, K_per_group, tiles_per_C, tiles_per_K;
         get_ck_per_group(m, n, k, kv, groups, C_per_group, K_per_group, tiles_per_C, tiles_per_K);
@@ -343,8 +343,9 @@ struct ConvAlgoDesp : public GemmAlgoDesp {
           logical_tile_count = get_unaligned_single_grouped_spconv_logical_tile_count(m, n, k, tile_shape[0], tile_shape[1], split_k_slices, kv,
                                                                                       op_type, groups, C_per_group, K_per_group,
                                                                                       tiles_per_C, tiles_per_K);  
-      }
-    }}
+      } else if (group_mode == ConvGroupMode::kDepthwise)
+        logical_tile_count = get_depthwise_spconv_logical_tile_count(m, n, k, tile_shape[0], tile_shape[1], split_k_slices, kv, op_type);
+    }
     int workspace_size = 0;
     if (split_k_slices > 1) {
       if (split_k_serial()) {
@@ -389,6 +390,18 @@ struct ConvAlgoDesp : public GemmAlgoDesp {
           return K_per_group % tile_shape[2] == 0 && C_per_group % tile_shape[1] == 0;
         case ConvOpType::kBackwardWeight:
           return K_per_group % tile_shape[0] == 0 && C_per_group % tile_shape[1] == 0;
+      }
+    }
+    if (group_mode == ConvGroupMode::kDepthwise){
+      if (C_per_group != K_per_group || K_per_group != 1)
+        return false;
+      switch (op_type) {
+        case ConvOpType::kForward:
+          return tile_shape[1] % tile_shape[2] == 0;
+        case ConvOpType::kBackwardInput:
+          assert(0);
+        case ConvOpType::kBackwardWeight:
+          assert(0);
       }
     }
   }

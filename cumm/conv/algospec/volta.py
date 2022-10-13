@@ -216,7 +216,9 @@ class AlgoSpecificVolta(object):
                  algo: GemmAlgo = GemmAlgo.Volta,
                  mask_sparse: bool = False,
                  increment_k_first: bool = False,
-                 access_per_vector: int = 1):
+                 access_per_vector: int = 1,
+                 is_depthwise: bool = False):
+        assert not is_depthwise, "Depthwise not supply except Simt"
         assert algo == GemmAlgo.Volta
         trans_a, trans_b, trans_c = problem.get_gemm_trans_abc()
         self.input_spec = InputVolta(problem, iter_algo, tile_shape,

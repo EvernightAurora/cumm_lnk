@@ -48,9 +48,12 @@ class WarpTileIterator(bases.GemmWarpIterator):
                  lane_layout: _LAYOUT_TYPES,
                  padding: int,
                  left: bool = False,
-                 partk: int = 1):
+                 partk: int = 1,
+                 is_depthwise_expand: bool = False,                     # exband k:  load 1*tbN  like a tbN * tbN 
+                 is_depthwise_expand_k: bool = True):                      # exband n:  load tbK*1 like a tbK * tbK
         element_per_acc = lane_mma_shape_km[0] * lane_mma_shape_km[1]
         self.sub_access_size = element_per_acc
+
         if padding > 0:
             if isinstance(
                     smem_layout,
@@ -103,6 +106,18 @@ class WarpTileIterator(bases.GemmWarpIterator):
         self.add_member("pointer_", self.access_pointer)
         # self.add_member("pointer_bkp_", self.access_pointer)
 
+        self.is_depthwise_expand = is_depthwise_expand
+        self.is_depthwise_expand_k = is_depthwise_expand_k
+        if is_depthwise_expand:
+            assert self.num_sub_access == 1, "Not sure"
+            assert not left, "Only for WarpIterB"
+            if is_depthwise_expand_k == False:
+                raise NotImplementedError("Come Soon")
+            if is_depthwise_expand_k:       # FWD,  N * G @ 1 * G
+                self.add_member("channel_idx_, base_channel_idx_, warp_n_, lane_offset_n_", "int")
+
+            # self.add_code_before_class("#define WDBG_OUTPUT")
+
         if partk > 1:
             self.add_member("wmma_k_index_", "int")
 
@@ -135,6 +150,14 @@ class WarpTileIterator(bases.GemmWarpIterator):
         pointer_ = reinterpret_cast<{self.access_pointer}>(ptr + offset);
 
         """)
+        if self.is_depthwise_expand:
+            if self.is_depthwise_expand_k:
+                code.raw(f"""
+                    warp_n_ = warp_idx_residual;
+                    channel_idx_ = 0;
+                    base_channel_idx_ = -1;
+                    lane_offset_n_ = lane_layout.inverse_1(lane_idx) * {self.lane_mma_shape[1]};
+                """)
         # if self.left:
         #     code.raw(f"tv::printf2_block_once(threadIdx.x, offset);")
         code.arg("ptr",
@@ -151,6 +174,8 @@ class WarpTileIterator(bases.GemmWarpIterator):
                                    self.lane_mma_shape_km, self.smem_layout,
                                    self.lane_layout, self.padding, self.left,
                                    self.partk)
+        if self.is_depthwise_expand:
+            raise NotImplementedError("Not Impl for python")
         lane_layout = new_obj.lane_layout.from_shape_python(new_obj.warp_shape)
         smem_layout = new_obj.smem_layout.from_shape_python(
             new_obj.tile_shape_km_padded[:2])
@@ -246,33 +271,76 @@ class WarpTileIterator(bases.GemmWarpIterator):
         static constexpr auto smem_layout = SmemLayout::from_shape({{{self.tile_shape_km_padded[0]}, {self.tile_shape_km_padded[1]}}});
         {self.access_pointer} dst_ptr = reinterpret_cast<{self.access_pointer}>(&frag);
         // kRow: 1, kCol: 2
-        TV_PRAGMA_UNROLL
-        for (int k = 0; k < {self.thread_access_shape[0]}; ++k) {{
-            TV_PRAGMA_UNROLL
-            for (int n = 0; n < {self.thread_access_shape[1]}; ++n) {{
-                // ref offset: [8, 128 / 4], (0, n * 8) ~= (0, 32)
-                // lane_id = 0, [0, 0-3], [0, 32-35]
-                // lane_id = 1, [0, 0-3], [0, 32-35]
-                // lane_id = 2, [0, 4-7], [0, 36-39]
-                // lane_id = 3, [0, 4-7], [0, 36-39]
-                // ...
-                // lane_id = 31, [0, 28-31], [0, 60-63]
-                auto offset = smem_layout(k * {self.lane_mma_shape[0]},
-                                        n * ({pccm.boolean(self.left)} ? {self.warp_shape[0]} : {self.warp_shape[1]}) *
-                                            {self.thread_access_delta[1]}) /
-                            {self.sub_access_size};
-
-                // auto offset = smem_layout(k * {self.lane_mma_shape[0]},
-                //                         n * {warp_mma_length * self.thread_access_delta[1] // self.sub_access_size});
-                TV_PRAGMA_UNROLL
-                for (int sub = 0; sub < {self.num_sub_access}; ++sub){{
-                    dst_ptr[k * {self.thread_access_shape[1] * self.num_sub_access} 
-                        + n * {self.num_sub_access} + sub] =
-                        pointer_[offset + sub + pointer_offset / {self.sub_access_size}];
-                }}
-            }}
-        }}
         """)
+        with code.for_(f"int k = 0; k < {self.thread_access_shape[0]}; ++k", prefix="TV_PRAGMA_UNROLL"):
+            with code.for_(f"int n = 0; n < {self.thread_access_shape[1]}; ++n", prefix="TV_PRAGMA_UNROLL"):
+                
+                # ref offset: [8, 128 / 4], (0, n * 8) ~= (0, 32)
+                # lane_id = 0, [0, 0-3], [0, 32-35]
+                # lane_id = 1, [0, 0-3], [0, 32-35]
+                # lane_id = 2, [0, 4-7], [0, 36-39]
+                # lane_id = 3, [0, 4-7], [0, 36-39]
+                # ...
+                # lane_id = 31, [0, 28-31], [0, 60-63]
+                if self.is_depthwise_expand:
+                    if self.is_depthwise_expand_k:
+                        code.raw(f"""
+                            auto offset = smem_layout(-(channel_idx_ - base_channel_idx_) * {self.lane_mma_shape[0]}, 
+                                                    n * {self.warp_shape[1]} * {self.thread_access_delta[1]}) / 
+                                                    {self.sub_access_size};
+                            int thread_k_base_idx = warp_n_ * {self.warp_tile_shape_km[1]} + lane_offset_n_;
+#ifdef WDBG_OUTPUT
+                            if (blockIdx.x == 0 && threadIdx.x < 32)
+                                printf("T%d, c_idx %d, bc_idx %d t_k_base %d, \\n",threadIdx.x,  channel_idx_, base_channel_idx_ , thread_k_base_idx);
+                            __syncwarp();
+#endif
+                            for (int sub = 0; sub < {self.num_sub_access}; ++sub) {{
+                                dst_ptr[k * {self.thread_access_shape[1] * self.num_sub_access} 
+                                    + n * {self.num_sub_access} + sub].fill(
+                                    tv::gemm::NumericConverter<{self.fragment_t}::value_type, int>::convert(0));
+                                for (int ele = 0; ele < {self.element_count}; ++ele) {{                 // n = thread_k_base_idx + n * {self.warp_shape[1]} + ele, k = channel_idx_ + k
+                                    if (channel_idx_ + k * {self.num_sub_access}  == thread_k_base_idx + n * {self.warp_shape[1]} + ele)
+                                        dst_ptr[k * {self.thread_access_shape[1] * self.num_sub_access} 
+                                        + n * {self.num_sub_access} + sub][ele] = pointer_[offset + sub + pointer_offset / {self.sub_access_size}][ele];
+                                }}
+                                /*
+                                if (channel_idx_ + k == thread_k_base_idx + n * {self.warp_shape[1]})
+                                    dst_ptr[k * {self.thread_access_shape[1] * self.num_sub_access} 
+                                        + n * {self.num_sub_access} + sub] =
+                                        pointer_[offset + sub + pointer_offset / {self.sub_access_size}];
+                                else
+                                    dst_ptr[k * {self.thread_access_shape[1] * self.num_sub_access} 
+                                        + n * {self.num_sub_access} + sub].fill(
+                                            tv::gemm::NumericConverter<{self.fragment_t}::value_type, int>::convert(0));
+                                */
+                            }}
+#ifdef WDBG_OUTPUT
+                            if (blockIdx.x == 0 && threadIdx.x < 32){{
+                                double a = tv::gemm::NumericConverter<double, tv::half_t>::convert(pointer_[offset  + pointer_offset / {self.sub_access_size}][0]);
+                                double b = tv::gemm::NumericConverter<double, tv::half_t>::convert(pointer_[offset  + pointer_offset / {self.sub_access_size}][1]);
+                                double c = tv::gemm::NumericConverter<double, tv::half_t>::convert(pointer_[offset  + pointer_offset / {self.sub_access_size}][2]);
+                                double d = tv::gemm::NumericConverter<double, tv::half_t>::convert(pointer_[offset  + pointer_offset / {self.sub_access_size}][3]);
+                                printf("T%d frag is %f, %f, %f, %f\\n", threadIdx.x, a, b, c, d);
+                            }}
+                            __syncwarp();
+#endif
+                        """)
+                else:
+                    code.raw(f"""
+                    auto offset = smem_layout(k * {self.lane_mma_shape[0]},
+                                            n * ({pccm.boolean(self.left)} ? {self.warp_shape[0]} : {self.warp_shape[1]}) *
+                                                {self.thread_access_delta[1]}) /
+                                {self.sub_access_size};
+                    
+                    // auto offset = smem_layout(k * {self.lane_mma_shape[0]},
+                    //                         n * {warp_mma_length * self.thread_access_delta[1] // self.sub_access_size});
+                    TV_PRAGMA_UNROLL
+                    for (int sub = 0; sub < {self.num_sub_access}; ++sub){{
+                        dst_ptr[k * {self.thread_access_shape[1] * self.num_sub_access} 
+                            + n * {self.num_sub_access} + sub] =
+                            pointer_[offset + sub + pointer_offset / {self.sub_access_size}];
+                    }}""")
+
         code.arg("frag", f"{self.fragment_t}&").arg("pointer_offset",
                                                     str(self.index_t))
         return code
@@ -330,6 +398,13 @@ class WarpTileIterator(bases.GemmWarpIterator):
         code.arg("wmma_k", "int")
         if self.partk > 1:
             code.raw("wmma_k_index_ = wmma_k;")
+        if self.is_depthwise_expand:
+            if self.is_depthwise_expand_k:
+                code.raw(f"""
+                    channel_idx_ = wmma_k;
+                    if (wmma_k % {self.tile_shape_km_padded[0]} == 0)
+                        base_channel_idx_ = wmma_k;
+                """)
         return code
 
     def set_wmma_k_index_python(self, wmma_k: int):

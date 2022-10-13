@@ -206,7 +206,8 @@ class AlgoSpecificSimt(object):
                  algo: GemmAlgo = GemmAlgo.Simt,
                  mask_sparse: bool = False,
                  increment_k_first: bool = False,
-                 access_per_vector: int = 1):
+                 access_per_vector: int = 1,
+                 is_depthwise: bool = False):
         assert algo == GemmAlgo.Simt or algo == GemmAlgo.SimtDP4A
         trans_a, trans_b, trans_c = problem.get_gemm_trans_abc()
         self.input_spec = InputSimt(problem, iter_algo, tile_shape,
@@ -214,7 +215,7 @@ class AlgoSpecificSimt(object):
                                     mask_sparse, increment_k_first)
         self.mma_spec = MmaSimt(self.input_spec, tile_shape, warp_tile_shape,
                                 num_stage, dtype_a, dtype_b, dtype_acc,
-                                trans_a, trans_b, tensorop, algo)
+                                trans_a, trans_b, tensorop, algo, is_depthwise=is_depthwise)
         shuffle_stride = ShuffleStrideType.NoShuffle
         if mask_sparse and not problem.op_type == ConvOpType.kBackwardWeight:
             shuffle_stride = ShuffleStrideType.ShuffleAC

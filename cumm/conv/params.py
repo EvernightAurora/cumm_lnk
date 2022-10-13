@@ -176,8 +176,6 @@ class ConvProblem(pccm.ParameterizedClass):
                 self.add_member("C_per_group, K_per_group", f"int")
                 # if self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
                 #     self.add_member("tiles_per_C, tiles_per_K", "int")
-            else:
-                raise NotImplementedError
         self.add_dependency(TensorViewNVRTC)
         # batch, input channel, output channel
         self.add_member("N, C, K", f"int")
@@ -344,6 +342,20 @@ class ConvProblem(pccm.ParameterizedClass):
                         return 0;
                 }}
                 """)
+            elif self.group_mode == ConvGroupMode.kDepthwise:
+                code.arg("tile_shape_n", "int")
+                code.raw(f"""
+                switch (op_type) {{
+                    case tv::gemm::ConvOpType::kForward:
+                        return kernel_volume * tv::div_up(tile_shape_n, tile_shape_k);
+                    case tv::gemm::ConvOpType::kBackwardInput:
+                        assert (0); // TODO
+                    case tv::gemm::ConvOpType::kBackwardWeight:
+                        assert (0); // TODO
+                    default:
+                        return 0;
+                }}
+                """)
             else:
                 raise NotImplementedError
         elif self.mask_sparse:
@@ -443,7 +455,11 @@ class ConvProblem(pccm.ParameterizedClass):
             msg = "kernel_volume"
         else:
             msg = ", ".join(f"ksize[{i}]" for i in range(self.ndim))
-        C = 'C' if self.group_mode == ConvGroupMode.kNone else "C_per_group"
+        C = 'C'
+        if self.group_mode in [ConvGroupMode.kSingleGroup, ConvGroupMode.kSingleGroupUnaligned]:
+            C = 'C_per_group'
+        elif self.group_mode == ConvGroupMode.kDepthwise:
+            C = '1'
 
         if self.layout_desp_weight.is_channel_first():
             code.raw(f"return {{K, {C}, {msg}}};")

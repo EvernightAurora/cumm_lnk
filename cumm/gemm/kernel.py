@@ -723,7 +723,7 @@ class GemmKernel(GemmComponentBase):
         if self.shuffle_stride != ShuffleStrideType.NoShuffle:
             res += f"_S{self.shuffle_stride.value}"
         if self.group_mode != ConvGroupMode.kNone:
-            dit = {ConvGroupMode.kSingleGroup: 'S', ConvGroupMode.kMultipleGroup: "M", ConvGroupMode.kDeepwise: "D", ConvGroupMode.kSingleGroupUnaligned: "SU"}
+            dit = {ConvGroupMode.kSingleGroup: 'S', ConvGroupMode.kMultipleGroup: "M", ConvGroupMode.kDepthwise: "D", ConvGroupMode.kSingleGroupUnaligned: "SU"}
             res += f"_G{dit[self.group_mode]}"
         return res
 

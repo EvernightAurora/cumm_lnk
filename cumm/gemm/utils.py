@@ -145,8 +145,8 @@ class GemmUtils(pccm.ParameterizedClass):
         code.arg("conv_op", "tv::gemm::ConvOpType")
         code.ret("int")
         code.raw(f"""
-            int total_gemm_k_iterations, gemm_k_iterations_per_split, gemm_k_size_per_split, k_per_group;
-            if (group_mode == tv::gemm::ConvGroupMode::kSingleGroup){{
+        int total_gemm_k_iterations, gemm_k_iterations_per_split, gemm_k_size_per_split, k_per_group;
+        if (group_mode == tv::gemm::ConvGroupMode::kSingleGroup){{
             if (conv_op == tv::gemm::ConvOpType::kForward){{   // N * gC @ C * gK => N * gK
                 k_per_group = k / groups;
                 assert(split_k == 1);

@@ -242,7 +242,9 @@ class AlgoSpecificTuring(object):
                  algo: GemmAlgo = GemmAlgo.Turing,
                  mask_sparse: bool = False,
                  increment_k_first: bool = False,
-                 access_per_vector: int = 1):
+                 access_per_vector: int = 1,
+                 is_depthwise: bool = False):
+        assert not is_depthwise, "Depthwise not supply except Simt"
         assert algo == GemmAlgo.Turing or algo == GemmAlgo.Ampere
         trans_a, trans_b, trans_c = problem.get_gemm_trans_abc()
         self.input_spec = InputTuring(problem, iter_algo, tile_shape,

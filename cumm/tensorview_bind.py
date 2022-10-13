@@ -125,7 +125,7 @@ class TensorViewBind(pccm.Class, pccm.pybind.PybindClassMixin):
             .value("kNone", tv::gemm::ConvGroupMode::kNone)
             .value("kSingleGroup", tv::gemm::ConvGroupMode::kSingleGroup)
             .value("kMultipleGroup", tv::gemm::ConvGroupMode::kMultipleGroup)
-            .value("kDeepwise", tv::gemm::ConvGroupMode::kDeepwise)
+            .value("kDepthwise", tv::gemm::ConvGroupMode::kDepthwise)
             .value("kSingleGroupUnaligned", tv::gemm::ConvGroupMode::kSingleGroupUnaligned);
 
         py::enum_<tv::gemm::ConvLayoutType>(module_, "ConvLayoutType")

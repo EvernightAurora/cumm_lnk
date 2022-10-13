@@ -14,3 +14,4 @@
 
 from .mma import BlockMmaStorage, Mma
 from .mma_multistage import MmaMultiStage, SharedMemoryClearOption
+from .mma_depthwise_pipelined import MmaDepthwiseConvPipelined

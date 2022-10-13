@@ -32,7 +32,7 @@ class ConvGroupMode(enum.Enum):
     kNone = 0
     kSingleGroup = 1        # aligned,  a group of c,k process by >=1 tile_block
     kMultipleGroup = 2      # aligned,  a tile block process >1 groups of c, k exactly
-    kDeepwise = 3           # nGroup = nChannel 
+    kDepthwise = 3           # nGroup = C = K
 
     kSingleGroupUnaligned = 4  # like kSingleGroup, but don't require align.   NotImpl in cutlass
 

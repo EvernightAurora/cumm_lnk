@@ -38,7 +38,7 @@ from cumm.gemm import (codeops, constants, gemmmath, layout, mask_iters,
                        volta_out_iters)
 from cumm.gemm.algospec import GemmAlgo, TensorOp, bases
 from cumm.gemm.algospec.core import ShuffleStrideType, get_min_arch_of_algo
-from cumm.gemm.blockmma import BlockMmaStorage, Mma, MmaMultiStage, SharedMemoryClearOption
+from cumm.gemm.blockmma import BlockMmaStorage, Mma, MmaMultiStage, SharedMemoryClearOption, MmaDepthwiseConvPipelined
 from cumm.gemm.core import MetaArray, array_type, metaseq, seq
 from cumm.gemm.constants import NVRTCMode
 from cumm.gemm.outputs import Output, OutputSmemStorage
@@ -143,6 +143,31 @@ class ConvUtils(pccm.Class):
                 assert(0);
         }}
         return grid_dims;
+        """)
+        return code
+
+    @pccm.static_function(header_only=True, attrs=["TV_HOST_DEVICE_INLINE"])
+    def get_depthwise_spconv_logical_tile_count(self):        # maybe only a placeholder
+        code = pccm.code()
+        code.arg("m,n,k,tile_m, tile_n, split_k_slices, kv, op_type", "const int&")
+        code.ret("tv::array<int, 3>")
+        code.raw(f"""
+        switch (op_type){{
+            case {ConvOpType.kForward.value}:
+                return get_spconv_logical_tile_count(m, n, k, tile_m, tile_n, split_k_slices, kv, op_type);
+
+            case {ConvOpType.kBackwardInput.value}:
+                assert(0); // TODO
+                break;
+            
+            case {ConvOpType.kBackwardWeight.value}:
+                assert(0); // TODO
+                break;
+
+            default:
+                assert(0);
+        }}
+        return tv::array<int, 3>();
         """)
         return code
 
@@ -451,9 +476,15 @@ class ConvParams(pccm.ParameterizedClass):
         k = mnk[2];
         """)
         # if not (self.mask_sparse and self.op_type == ConvOpType.kBackwardWeight):
-        code.raw(f"""
-        gemm_k_iterations = problem.implicit_gemm_k_iterations({optype_to_cpp[self.op_type]}, {self.tile_shape[2]});
-        """)
+        if self.group_mode == ConvGroupMode.kDepthwise:
+            code.raw(f"""
+            gemm_k_iterations = problem.implicit_gemm_k_iterations({optype_to_cpp[self.op_type]}, {self.tile_shape[2]}, {self.tile_shape[1]});
+            """)
+            # code.raw("""printf("the gemm_k_iter is %d\\n", gemm_k_iterations);""")
+        else:
+            code.raw(f"""
+            gemm_k_iterations = problem.implicit_gemm_k_iterations({optype_to_cpp[self.op_type]}, {self.tile_shape[2]});
+            """)
         if self.mask_sparse:
             # assert self.op_type == ConvOpType.kForward
             C_or_K = "C" if self.op_type == ConvOpType.kForward else "K"
@@ -492,6 +523,12 @@ class ConvParams(pccm.ParameterizedClass):
                     {self.tile_shape[0]}, {self.tile_shape[1]}, split_k_slices, problem.kernel_volume, {self.op_type.value}, 
                     problem.groups, problem.C_per_group, problem.K_per_group, tiles_per_C, tiles_per_K);
                 """)
+            elif self.group_mode == ConvGroupMode.kDepthwise:
+                code.raw(f"""
+                auto grid_dims_arr = ConvUtils::get_depthwise_spconv_logical_tile_count(m, n, k, 
+                    {self.tile_shape[0]}, {self.tile_shape[1]}, split_k_slices, problem.kernel_volume, {self.op_type.value});
+                """)
+
             else:
                 raise NotImplementedError
         else:
@@ -513,9 +550,12 @@ class ConvParams(pccm.ParameterizedClass):
             gemm_k_iterations /= problem.kernel_volume;
             """)
             if self.increment_k_first:
+                iterb_inc_cnt = "gemm_k_iterations"
+                if self.group_mode == ConvGroupMode.kDepthwise:
+                    iterb_inc_cnt = "1"
                 code.raw(f"""
                 itera_params_.set_inc_reset_for_inc_k_first(gemm_k_iterations);
-                iterb_params_.set_inc_reset_for_inc_k_first(gemm_k_iterations);
+                iterb_params_.set_inc_reset_for_inc_k_first({iterb_inc_cnt});
                 """)
             
             code.raw("out_params_ = OutIterParams(n, mask_argsort_ptr);")
@@ -530,6 +570,8 @@ class ConvParams(pccm.ParameterizedClass):
             if self.op_type == ConvOpType.kBackwardWeight:
                 if self.group_mode == ConvGroupMode.kSingleGroup or self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
                     out_n = "problem.C_per_group * problem.kernel_volume"
+                elif self.group_mode == ConvGroupMode.kDepthwise:
+                    out_n = "problem.kernel_volume"
             code.raw(f"out_params_ = OutIterParams({out_n});")
             if self.split_d_params:
                 code.raw(f"out_params_d_ = d_is_bias ? OutIterParams(0) : OutIterParams({out_n});")
@@ -630,7 +672,7 @@ class ConvKernel(GemmComponentBase):
         algo_spec = get_algo_spec(self.algo)(
             problem, tile_shape, warp_tile_shape, num_stage, dtype_a, dtype_b,
             dtype_c, dtype_acc, dtype_comp, iter_algo, tensorop, algo,
-            mask_sparse, increment_k_first, access_per_vector)
+            mask_sparse, increment_k_first, access_per_vector, is_depthwise = (group_mode == ConvGroupMode.kDepthwise))
         self.algo_spec = algo_spec
         self.input_spec = algo_spec.input_spec
         self.mma_spec = algo_spec.mma_spec
@@ -709,7 +751,20 @@ class ConvKernel(GemmComponentBase):
         # first_input_clear: for gemm, we don't need to clear frag in every input load
         # but gemm need it. gemm clear frag in iter.load, so we don't need
         # initial clear in mma.
-        if self.algo == GemmAlgo.Ampere and (self.mask_sparse == False or self.increment_k_first) and self.access_per_vector == 1:
+        if self.group_mode == ConvGroupMode.kDepthwise:
+            self.mma_container = MmaDepthwiseConvPipelined(
+                dtype_acc,
+                self.partk,
+                num_stage,
+                self.mma_spec,
+                self.gemm_smem_storage,
+                first_input_clear=False,
+                clear_mask=False,
+                mask_sparse=self.mask_sparse,
+                increment_k_first=increment_k_first,
+                op_type= self.problem.op_type
+            )
+        elif self.algo == GemmAlgo.Ampere and (self.mask_sparse == False or self.increment_k_first) and self.access_per_vector == 1:
             self.mma_container = MmaMultiStage(
                 dtype_acc,
                 self.partk,
@@ -734,7 +789,8 @@ class ConvKernel(GemmComponentBase):
                 clear_mask=False,
                 mask_sparse=self.mask_sparse,
                 increment_k_first=increment_k_first,
-                is_sparse_wgrad=self.problem.op_type == ConvOpType.kBackwardWeight)
+                is_sparse_wgrad=self.problem.op_type == ConvOpType.kBackwardWeight
+                )
             
         self.output = Output(dtype_acc, self.warp_count_shape, self.partk,
                              self.output_spec, self.out_smem_storage)
@@ -790,7 +846,7 @@ class ConvKernel(GemmComponentBase):
                 res += 'S'
             elif self.group_mode == ConvGroupMode.kMultipleGroup:
                 res += 'M'
-            elif self.group_mode == ConvGroupMode.kDeepwise:
+            elif self.group_mode == ConvGroupMode.kDepthwise:
                 res += 'D'
             elif self.group_mode == ConvGroupMode.kSingleGroupUnaligned:
                 res += 'SU'
@@ -979,6 +1035,51 @@ class ConvKernel(GemmComponentBase):
                     b_offset = f"{k_offset}, block_offset_in_C * {self.tile_shape[1]} + group_idx * params.problem.C_per_group"
                     c_offset = f"{m_offset}, filter_offset * params.problem.C_per_group + block_offset_in_C * {self.tile_shape[1]}"
                     c_extent = f"params.problem.K_per_group * (group_idx + 1), filter_offset * params.problem.C_per_group + params.problem.C_per_group"
+#############################################Depthwise group mode#######################################
+            elif self.group_mode == ConvGroupMode.kDepthwise:
+                if not self.mask_sparse:
+                    raise NotImplementedError
+                code.raw("""
+                    ConvProblem problem_a, problem_b;
+                    
+                """)
+                if self.problem.op_type == ConvOpType.kForward:
+                    code.raw(f"""
+                        int group_idx = {n_offset};
+                        problem_a = params.problem;
+                        problem_b = params.problem.as_new_C_K(1, params.problem.K);
+                        // printf("bx %d by %d bz %d g_id %d\\n", blockIdx.x, blockIdx.y, blockIdx.z, group_idx);
+                    """)
+                    a_offset = f"{m_offset}, {n_offset}"
+                    b_offset = f"{n_offset}, {0}"
+                    c_offset = f"{m_offset}, {n_offset}"
+                    c_extent = f"params.m, params.n"
+                elif self.problem.op_type == ConvOpType.kBackwardInput:
+                    raise NotImplementedError  # TODO
+                    code.raw(f"""
+                        int group_idx = tile_offset_k;
+                        tile_offset_k = 0;
+                        problem_a = params.problem;
+                        problem_b = params.problem.as_new_C_K(params.problem.C_per_group, params.problem.K);
+                    """)
+                    a_offset = f"{m_offset}, group_idx * params.problem.K_per_group"
+                    b_offset = f"group_idx * params.problem.K_per_group, {n_offset}"
+                    k_offset = "0"
+                    c_offset = f"{m_offset}, {n_offset} + group_idx * params.problem.C_per_group"
+                    c_extent = f"params.m, params.n"
+                else:
+                    raise NotImplementedError  # TODO
+                    code.raw(f"""
+                        int group_idx = {m_offset} / params.problem.K_per_group;
+                        problem_a = params.problem;
+                        problem_b = params.problem;
+                        int num_block_in_C = tv::div_up(params.problem.C_per_group, {self.tile_shape[1]});
+                        int block_offset_in_C = tile_offset_n % num_block_in_C;
+                    """)
+                    a_offset = f"{k_offset}, {m_offset}"
+                    b_offset = f"{k_offset}, block_offset_in_C * {self.tile_shape[1]} + group_idx * params.problem.C_per_group"
+                    c_offset = f"tile_offset_m * {self.tile_shape[0]}, filter_offset * params.problem.C_per_group + block_offset_in_C * {self.tile_shape[1]}"
+                    c_extent = f"params.m, filter_offset * params.problem.C_per_group + params.problem.C_per_group"
             else:
                 raise NotImplementedError
 

@@ -518,7 +518,7 @@ class ConvGroupMode(Enum):
   kNone = 0
   kSingleGroup = 1        
   kMultipleGroup = 2 
-  kDeepwise = 3  
+  kDepthwise = 3  
   kSingleGroupUnaligned = 4
 
 #   Tanh = 3

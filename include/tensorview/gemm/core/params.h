@@ -399,9 +399,9 @@ struct ConvAlgoDesp : public GemmAlgoDesp {
         case ConvOpType::kForward:
           return tile_shape[1] % tile_shape[2] == 0;
         case ConvOpType::kBackwardInput:
-          assert(0);
+          return tile_shape[1] % tile_shape[2] == 0;
         case ConvOpType::kBackwardWeight:
-          assert(0);
+          return tile_shape[0] == tile_shape[1];
       }
     }
   }

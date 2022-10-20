@@ -347,11 +347,11 @@ class ConvProblem(pccm.ParameterizedClass):
                 code.raw(f"""
                 switch (op_type) {{
                     case tv::gemm::ConvOpType::kForward:
-                        return kernel_volume * tv::div_up(tile_shape_n, tile_shape_k);
+                        return kernel_volume * min(tv::div_up(tile_shape_n, tile_shape_k), tv::div_up(C, tile_shape_k));
                     case tv::gemm::ConvOpType::kBackwardInput:
-                        assert (0); // TODO
+                        return kernel_volume * min(tv::div_up(tile_shape_n, tile_shape_k), tv::div_up(C, tile_shape_k)); 
                     case tv::gemm::ConvOpType::kBackwardWeight:
-                        assert (0); // TODO
+                        return tv::div_up(tv::div_up(N, split_k_slices), tile_shape_k);
                     default:
                         return 0;
                 }}

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import enum
+from operator import is_
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type, Union
 
@@ -32,6 +33,7 @@ from cumm.gemm.bases import (GemmApply, GemmInputIterator, GemmIterator,
                              GemmOutWarpIterator)
 from cumm.gemm.core import MetaArray, metaseq, seq
 from cumm.gemm.wmma.simt import WarpMmaSimt
+from cumm.gemm.depthwise_wgrad_transformer import DepthwiseWgradTramsformer
 
 from .core import GemmAlgo, ShuffleStrideType, TensorOp
 
@@ -348,9 +350,15 @@ class OutputSimt(bases.Output):
             tensorop: Optional[TensorOp] = None,
             algo: GemmAlgo = GemmAlgo.Simt,
             shuffle_stride: ShuffleStrideType = ShuffleStrideType.NoShuffle,
-            access_per_vector: int = 1):
+            access_per_vector: int = 1,
+            is_depthwise_wgrad: bool = False):
         assert algo == GemmAlgo.Simt or algo == GemmAlgo.SimtDP4A
         self._mma_spec = mma_spec
+        self.is_depthwise_wgrad = is_depthwise_wgrad
+        self.depth_transformer = None
+        if self.is_depthwise_wgrad:
+            self.depth_transformer = DepthwiseWgradTramsformer(mma_spec, trans_c, dtype_acc, 
+                                                                tile_shape, warp_tile_shape, layout.RowMajorInterleaved(self.mma_spec.input_sub_tile_shape_b[0]))
         self.warp_count_shape = tile_shape // warp_tile_shape
         self.warp_count = self.warp_count_shape.prod()
         self.acc_frag_iter = out_iters.OutFragIter(

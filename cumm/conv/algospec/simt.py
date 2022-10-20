@@ -231,4 +231,5 @@ class AlgoSpecificSimt(object):
                                       tensorop,
                                       algo,
                                       shuffle_stride=shuffle_stride,
-                                      access_per_vector=access_per_vector)
+                                      access_per_vector=access_per_vector,
+                                      is_depthwise_wgrad=(problem.op_type == ConvOpType.kBackwardWeight and is_depthwise))

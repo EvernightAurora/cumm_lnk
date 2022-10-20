@@ -156,7 +156,8 @@ class Mma(GemmComponentBase):
                  mask_sparse: bool = False,
                  increment_k_first=False,
                  is_sparse_wgrad: bool = False):
-        super().__init__()
+        if isinstance(self, Mma):
+            super().__init__()
         self.dtype_acc = dtype_acc
         miter = MaskIGemmIterator(increment_k_first)
         self.add_param_class("mma_ns_miter", miter, "MaskIGemmIterator")

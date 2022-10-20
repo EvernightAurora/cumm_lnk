@@ -91,11 +91,12 @@ get_single_grouped_spconv_logical_tile_count(int m, int n, int k, int tile_m, in
 TV_HOST_DEVICE_INLINE tv::array<int, 3>
 get_depthwise_spconv_logical_tile_count(int m, int n, int k, int tile_m, int tile_n,
                               int split_k_slices, int kv, ConvOpType op_type) {
-  tv::array<int, 3> grid_dims;
   if (op_type == ConvOpType::kForward)
     return get_spconv_logical_tile_count(m, n, k, tile_m, tile_n, split_k_slices, kv, op_type);
+  else if (op_type == ConvOpType::kBackwardInput)
+    return get_spconv_logical_tile_count(m, n, k, tile_m, tile_n, split_k_slices, kv, op_type);
   else
-    assert(0);
+    return get_spconv_logical_tile_count(m, kv, k, tile_m, tile_n, split_k_slices, kv, op_type);
   return tv::array<int, 3>();
 }
 

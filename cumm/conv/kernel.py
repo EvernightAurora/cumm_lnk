@@ -157,11 +157,10 @@ class ConvUtils(pccm.Class):
                 return get_spconv_logical_tile_count(m, n, k, tile_m, tile_n, split_k_slices, kv, op_type);
 
             case {ConvOpType.kBackwardInput.value}:
-                assert(0); // TODO
-                break;
+                return get_spconv_logical_tile_count(m, n, k, tile_m, tile_n, split_k_slices, kv, op_type);
             
             case {ConvOpType.kBackwardWeight.value}:
-                assert(0); // TODO
+                return get_spconv_logical_tile_count(m, 1 * kv, k, tile_m, tile_n, split_k_slices, kv, op_type);
                 break;
 
             default:
@@ -551,7 +550,7 @@ class ConvParams(pccm.ParameterizedClass):
             """)
             if self.increment_k_first:
                 iterb_inc_cnt = "gemm_k_iterations"
-                if self.group_mode == ConvGroupMode.kDepthwise:
+                if self.group_mode == ConvGroupMode.kDepthwise and self.op_type == ConvOpType.kForward:
                     iterb_inc_cnt = "1"
                 code.raw(f"""
                 itera_params_.set_inc_reset_for_inc_k_first(gemm_k_iterations);
@@ -575,7 +574,10 @@ class ConvParams(pccm.ParameterizedClass):
             code.raw(f"out_params_ = OutIterParams({out_n});")
             if self.split_d_params:
                 code.raw(f"out_params_d_ = d_is_bias ? OutIterParams(0) : OutIterParams({out_n});")
-
+        # if self.op_type == ConvOpType.kBackwardWeight and self.group_mode == ConvGroupMode.kDepthwise:
+        #     code.raw(f"""
+        #         printf("here grid dim is  <%d %d %d>,  gemm_k is %d\\n", grid_dims_arr[0], grid_dims_arr[1], grid_dims_arr[2], gemm_k_iterations);
+        #     """)
         return code
 
 
@@ -764,6 +766,8 @@ class ConvKernel(GemmComponentBase):
                 increment_k_first=increment_k_first,
                 op_type= self.problem.op_type
             )
+            if self.problem.op_type == ConvOpType.kBackwardWeight:
+                self.add_param_class("depth_transformer", algo_spec.output_spec.depth_transformer, "DepthwiseTransformer")
         elif self.algo == GemmAlgo.Ampere and (self.mask_sparse == False or self.increment_k_first) and self.access_per_vector == 1:
             self.mma_container = MmaMultiStage(
                 dtype_acc,
@@ -1055,31 +1059,24 @@ class ConvKernel(GemmComponentBase):
                     c_offset = f"{m_offset}, {n_offset}"
                     c_extent = f"params.m, params.n"
                 elif self.problem.op_type == ConvOpType.kBackwardInput:
-                    raise NotImplementedError  # TODO
                     code.raw(f"""
-                        int group_idx = tile_offset_k;
-                        tile_offset_k = 0;
                         problem_a = params.problem;
-                        problem_b = params.problem.as_new_C_K(params.problem.C_per_group, params.problem.K);
+                        problem_b = params.problem.as_new_C_K(1, params.problem.K);
                     """)
-                    a_offset = f"{m_offset}, group_idx * params.problem.K_per_group"
-                    b_offset = f"group_idx * params.problem.K_per_group, {n_offset}"
+                    a_offset = f"{m_offset}, {n_offset}"
+                    b_offset = f"{n_offset}, 0"                 # n_offset as k_offset
                     k_offset = "0"
-                    c_offset = f"{m_offset}, {n_offset} + group_idx * params.problem.C_per_group"
+                    c_offset = f"{m_offset}, {n_offset}"
                     c_extent = f"params.m, params.n"
                 else:
-                    raise NotImplementedError  # TODO
                     code.raw(f"""
-                        int group_idx = {m_offset} / params.problem.K_per_group;
                         problem_a = params.problem;
                         problem_b = params.problem;
-                        int num_block_in_C = tv::div_up(params.problem.C_per_group, {self.tile_shape[1]});
-                        int block_offset_in_C = tile_offset_n % num_block_in_C;
                     """)
                     a_offset = f"{k_offset}, {m_offset}"
-                    b_offset = f"{k_offset}, block_offset_in_C * {self.tile_shape[1]} + group_idx * params.problem.C_per_group"
-                    c_offset = f"tile_offset_m * {self.tile_shape[0]}, filter_offset * params.problem.C_per_group + block_offset_in_C * {self.tile_shape[1]}"
-                    c_extent = f"params.m, filter_offset * params.problem.C_per_group + params.problem.C_per_group"
+                    b_offset = f"{k_offset}, {m_offset}"
+                    c_offset = f"{m_offset}, tile_offset_n"
+                    c_extent = f"params.m, tile_offset_n + 1"
             else:
                 raise NotImplementedError
 
@@ -1167,13 +1164,22 @@ class ConvKernel(GemmComponentBase):
                             return;
                         }}
                         """)
-                    else:
+                    elif self.group_mode in [ConvGroupMode.kSingleGroup, ConvGroupMode.kSingleGroupUnaligned]:
                         code.raw(f"""
                         int filter_offset = tile_offset_n / num_block_in_C;
                         if (!(params.mask_filter & (1 << filter_offset))){{
                             return;
                         }}
                         """)
+                    elif self.group_mode == ConvGroupMode.kDepthwise:
+                        code.raw(f"""
+                        int filter_offset = tile_offset_n;
+                        if (!(params.mask_filter & (1 << filter_offset))){{
+                            return;
+                        }}
+                        """)
+                    else:
+                        raise NotImplementedError
             code.raw(f"""
             Mma mma(gemm_shared_mem, thread_idx, warp_idx_k, warp_m, warp_n, lane_idx);
             {self.fragment_c_t} accumulators;
@@ -1206,10 +1212,28 @@ class ConvKernel(GemmComponentBase):
                     code.raw(f"""
                     mma(params.gemm_k_iterations, accumulators, input_iter_A, input_iter_B, accumulators);
                     """)
+            # if self.problem.op_type == ConvOpType.kBackwardWeight:
+            #     code.raw(f"""
+            #     if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0){{
+            #         int wia, wib;
+            #         for (wia=0; wia<8; ++wia){{
+            #             for (wib=0; wib<4; ++wib)  
+            #                 printf("%.2lf-", accumulators[wia * 4 + wib]);
+            #             printf("\\n");
+            #             }}
+            #     }}
+            #     __syncthreads();
+            #     """)
+
             # code.raw(f"""
             # // if (threadIdx.x == 3)
             # tv::print_fragment_meta_once<float>(accumulators, "accumulator");
             # """)
+            if self.problem.op_type == ConvOpType.kBackwardWeight and self.group_mode == ConvGroupMode.kDepthwise:
+                code.raw(f"""
+                    DepthwiseTransformer depth_trans(lane_idx);
+                    depth_trans(accumulators, warp_m, warp_n, SharedStorage);
+                """)
 
             code.raw(f"""
             // // C = alpha * A@B + beta * D, D can be C

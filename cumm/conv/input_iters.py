@@ -841,7 +841,7 @@ class WeightIteratorDP4A(bases.ConvInputIterator):
                                 prefetch_size=128)
         self.add_param_class("gload", self.gload, "GlobalLoad")
 
-        assert tmap.iterations.prod() * sub_tile_shape[0] < 32, "error"
+        assert tmap.iterations.prod() * sub_tile_shape[0] <= 32, "error"
         self.add_dependency(TensorViewNVRTC, GemmBasicKernel)
         if not optimized:
             self.params = AnalyticParams(problem_size, input_layout)

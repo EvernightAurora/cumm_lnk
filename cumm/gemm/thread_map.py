@@ -187,6 +187,48 @@ class PitchLinear(InputThreadMapBase):
             (thread_id % self.tile_access_shape[1]) * self.sub_tile_shape[1])
 
 
+class PitchLinearMod(InputThreadMapBase):
+    def __init__(self, tile_shape: MetaArray[int],
+                 sub_tile_shape: MetaArray[int], num_threads: int):
+        super().__init__()
+        self.add_dependency(TensorViewNVRTC)
+        self.tile_shape = tile_shape
+        self.sub_tile_shape = sub_tile_shape
+        self.num_threads = num_threads
+        self.element_per_acc = sub_tile_shape[1]  # type: int
+        self.tile_access_shape = tile_shape // sub_tile_shape
+
+        self._iterations = calc_thread_access_shape(tile_shape, num_threads,
+                                                    sub_tile_shape)
+        self._delta = calc_thread_access_delta(
+            metaseq(tile_shape[0], tile_shape[1]), num_threads, sub_tile_shape)
+
+    @property
+    def iterations(self) -> MetaArray[int]:
+        return self._iterations
+
+    @property
+    def delta(self) -> MetaArray[int]:
+        return self._delta
+
+    def __repr__(self):
+        return f"PitchLinear[{self.iterations}|{self.delta}]"
+
+    @pccm.cuda.static_function(host=True, device=True, forceinline=True)
+    def initial_offset(self):
+        code = pccm.FunctionCode(f"""
+            thread_id %= {self.num_threads};
+            return {{(thread_id / {self.tile_access_shape[1]}) * {self.sub_tile_shape[0]},
+                    (thread_id % {self.tile_access_shape[1]}) *  {self.sub_tile_shape[1]}}};
+        """)
+        return code.arg("thread_id", "int").ret("tv::array<int, 2>")
+
+    def initial_offset_python(self, thread_id: int):
+        return seq(
+            (thread_id // self.tile_access_shape[1]) * self.sub_tile_shape[0],
+            (thread_id % self.tile_access_shape[1]) * self.sub_tile_shape[1])
+
+
 class PitchLinearWarpRaked(InputThreadMapBase):
     def __init__(self, tile_shape: MetaArray[int],
                  sub_tile_shape: MetaArray[int], warp_shape: MetaArray[int],

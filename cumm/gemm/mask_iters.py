@@ -113,6 +113,8 @@ class WarpTileIterator(bases.GemmWarpIterator):
             assert not left, "Only for WarpIterB"
             # FWD,  N * G @ 1 * G
             self.add_member("channel_idx_, base_channel_idx_, warp_n_, lane_offset_n_", "int")
+            self.shared_load = memory.SharedLdSt(dtype.itemsize())
+            self.add_param_class("SharedLdSt", self.shared_load, "CpShared")
 
             # self.add_code_before_class("#define WDBG_OUTPUT")
 
@@ -231,7 +233,7 @@ class WarpTileIterator(bases.GemmWarpIterator):
         static constexpr auto smem_layout = SmemLayout::from_shape({{{self.tile_shape_km_padded[0]}, {self.tile_shape_km_padded[1]}}});
         auto offset = 
         pointer_ += smem_layout({self.wmma_mat_shape_per_k_iter[0]}, 0) / {self.sub_access_size};
-        
+
         """)
         if self.partk > 1:
             k_dist = (self.partk - 1) * self.num_k_iters
@@ -277,6 +279,8 @@ class WarpTileIterator(bases.GemmWarpIterator):
         {self.access_pointer} dst_ptr = reinterpret_cast<{self.access_pointer}>(&frag);
         // kRow: 1, kCol: 2
         """)
+        # if self.left and self.warp_shape == [1, 32]:
+        #     code.raw("static int nCall=0;nCall += 1;")
         with code.for_(f"int k = 0; k < {self.thread_access_shape[0]}; ++k", prefix="TV_PRAGMA_UNROLL"):
             with code.for_(f"int n = 0; n < {self.thread_access_shape[1]}; ++n", prefix="TV_PRAGMA_UNROLL"):
                 
@@ -317,7 +321,7 @@ class WarpTileIterator(bases.GemmWarpIterator):
                                 + n * {self.num_sub_access} + sub].fill(
                                 tv::gemm::NumericConverter<{self.fragment_t}::value_type, int>::convert(0));
                             for (int ele = 0; ele < {self.sub_access_size}; ++ele) {{                 // n = thread_k_base_idx + n * {self.warp_shape[1]} + ele, k = channel_idx_ + k
-                                if (channel_idx_ + k * {self.num_sub_access}  == thread_k_base_idx + n * {self.warp_shape[1]} + sub * {self.sub_access_size} + ele)
+                                if (channel_idx_ + k * {self.num_sub_access}  == thread_k_base_idx + n * {self.warp_shape[1]} * {self.thread_access_delta[1]} + sub * {self.sub_access_size} + ele)
                                     dst_ptr[k * {self.thread_access_shape[1] * self.num_sub_access} 
                                     + n * {self.num_sub_access} + sub][ele] = pointer_[offset + {src_sub_used} + pointer_offset / {self.sub_access_size}][{pnt_idx}];
                             }}
@@ -326,10 +330,7 @@ class WarpTileIterator(bases.GemmWarpIterator):
                         if (blockIdx.x == 0 && threadIdx.x < 32){{
                             typedef float TYPE;
                             double a = tv::gemm::NumericConverter<double, TYPE>::convert(pointer_[offset  + pointer_offset / {self.sub_access_size}][0]);
-                            double b = tv::gemm::NumericConverter<double, TYPE>::convert(pointer_[offset  + pointer_offset / {self.sub_access_size}][1]);
-                            double c = tv::gemm::NumericConverter<double, TYPE>::convert(pointer_[offset  + pointer_offset / {self.sub_access_size} + 1][0]);
-                            double d = tv::gemm::NumericConverter<double, TYPE>::convert(pointer_[offset  + pointer_offset / {self.sub_access_size} + 1][1]);
-                            printf("T%d frag is %f, %f, %f, %f\\n", threadIdx.x, a, b, c, d);
+                            printf("T%d frag is %f\\n", threadIdx.x, a);
                         }}
                         __syncwarp();
 #endif
@@ -349,6 +350,58 @@ class WarpTileIterator(bases.GemmWarpIterator):
                             + n * {self.num_sub_access} + sub] =
                             pointer_[offset + sub + pointer_offset / {self.sub_access_size}];
                     }}""")
+                # if self.left and self.warp_shape == [1, 32]:
+                #     code.raw(f"""
+                #         if (blockIdx.x == 0 && threadIdx.x < 32 && blockIdx.y == 0){{
+                #             int bank_id = reinterpret_cast<int64_t>(&pointer_[offset + 0 + pointer_offset / {self.sub_access_size}]) % 128;
+                #             int bank_res = bank_id % 4;
+                #             bank_id /= 4;
+
+                #             printf("%d TH  T%d %d th called %dth bank %d pos for %llx idx\\n", nCall, threadIdx.x, n, bank_id, bank_res, &pointer_[offset + 0 + pointer_offset / {self.sub_access_size}]);
+                #         }}
+                #         __syncwarp();
+                #     """)
+                    
+
+        code.arg("frag", f"{self.fragment_t}&").arg("pointer_offset",
+                                                    str(self.index_t))
+        return code
+
+    @pccm.cuda.member_function(device=True, forceinline=True)
+    def load_depthwise_fprop_no_mask(self):
+        if not self.is_depthwise_expand:
+            return pccm.code()
+        code = pccm.FunctionCode(f"""
+        static constexpr auto smem_layout = SmemLayout::from_shape({{{self.tile_shape_km_padded[0]}, {self.tile_shape_km_padded[1]}}});
+        {self.access_pointer} dst_ptr = reinterpret_cast<{self.access_pointer}>(&frag);
+        // kRow: 1, kCol: 2
+        """)
+        with code.for_(f"int k = 0; k < {self.thread_access_shape[0]}; ++k", prefix="TV_PRAGMA_UNROLL"):
+            with code.for_(f"int n = 0; n < {self.thread_access_shape[1]}; ++n", prefix="TV_PRAGMA_UNROLL"):
+                
+                code.raw(f"""
+                    auto offset = smem_layout(-(channel_idx_ - base_channel_idx_) * {self.lane_mma_shape[0]}, 
+                                            n * {self.warp_shape[1]} * {self.thread_access_delta[1]}) / 
+                                            {self.sub_access_size};
+                """)
+                pnt_idx = "ele"
+                src_sub_used = "sub"
+                
+                code.raw(f"""
+                    int thread_k_base_idx = warp_n_ * {self.warp_tile_shape_km[1]} + lane_offset_n_;
+                    TV_PRAGMA_UNROLL
+                    for (int sub = 0; sub < {self.num_sub_access}; ++sub) {{
+//                        dst_ptr[k * {self.thread_access_shape[1] * self.num_sub_access} 
+//                                + n * {self.num_sub_access} + sub].fill(
+//                                tv::gemm::NumericConverter<{self.fragment_t}::value_type, int>::convert(0));
+                        TV_PRAGMA_UNROLL
+                        for (int ele = 0; ele < {self.sub_access_size}; ++ele) {{                 // n = thread_k_base_idx + n * {self.warp_shape[1]} + ele, k = channel_idx_ + k
+                                CpShared::load(&dst_ptr[k * {self.thread_access_shape[1] * self.num_sub_access} 
+                                + n * {self.num_sub_access} + sub][ele], &pointer_[offset + {src_sub_used} + pointer_offset / {self.sub_access_size}][{pnt_idx}]);
+                        }}
+                    }}
+
+                """)
 
         code.arg("frag", f"{self.fragment_t}&").arg("pointer_offset",
                                                     str(self.index_t))
@@ -517,6 +570,11 @@ class SmemTileIteratorV2(bases.GemmSmemIterator):
         code.arg("stride", "int")
         code.arg("ptr", f"{self.dtype}*")
         code.arg("thread_id", "int")
+        # if self.element_count == 32 and self.tile_shape == [32, 32]:
+        #     code.raw(f"""
+        #     printf("B%d T%d, offset %x with ori-pnter %lx\\n", blockIdx.x, threadIdx.x, offset, ptr);
+        #     __syncwarp();
+        #     """)
         return code
 
     def python_ctor(self, stride: int, ptr: ArrayPtr, thread_id: int):
@@ -635,7 +693,15 @@ class SmemTileIteratorV2(bases.GemmSmemIterator):
                 reinterpret_cast<{self.access_t} *>(byte_pointer);
             TV_PRAGMA_UNROLL
             for (int c = 0; c < {self.thread_access_shape[contig]}; ++c) {{
-                int idx = c + s * {self.thread_access_shape[contig]};
+                int idx = c + s * {self.thread_access_shape[contig]};""")
+        # if self.element_count == 32 and self.tile_shape == [32, 32]:
+        #     code.raw(f"""
+        #     if(true || blockIdx.x == 0)
+        #         printf("B%d T%d, calling s%d c%d for addr %lx\\n", blockIdx.x, threadIdx.x, s, c, &access_ptr[c * {self.iteration_delta[contig]} / {self.element_per_acc}]);
+        #     __syncwarp();
+        #     """)
+
+        code.raw(f"""
                 access_ptr[c * {self.iteration_delta[contig]} / {self.element_per_acc}] =
                     frag_ptr[idx];
             }}
@@ -688,6 +754,160 @@ class SmemTileIteratorV2(bases.GemmSmemIterator):
 
     async def store_python(self, frag: ArrayPtr):
         return await self.store_with_pointer_offset_python(frag, 0)
+
+
+class SmemTileIteratorVectorSplitTransposed(bases.GemmSmemIterator):
+    def __init__(self,
+                 dtype: dtypes.DType,
+                 tmap: Union[thread_map.PitchLinear,
+                             thread_map.PitchLinearWarpRaked],
+                 tile_shape: MetaArray[int],
+                 sub_tile_shape: MetaArray[int],
+                 advance_axis: int,
+                 num_threads: int,
+                 smem_shape: MetaArray[int],
+                 transposed_input: bool = True):
+        assert transposed_input
+        self.tile_shape = tile_shape
+        self.tmap = tmap
+        self.sub_tile_shape = sub_tile_shape
+        self.access_shape = self.tile_shape // self.sub_tile_shape  # type: MetaArray[int]
+        self.interleave = sub_tile_shape[0]
+
+        access_shape = tmap.iterations
+        delta = tmap.delta
+
+        access_shape = access_shape[::-1]
+        delta = delta[::-1]
+        delta = seq(delta[0] // self.interleave, delta[1] * self.interleave)
+        self.thread_access_shape = access_shape
+        self.iteration_delta = delta
+        # print("self.thread_access_shape", self.thread_access_shape, self.iteration_delta)
+        element_count = self.thread_access_shape.prod() * sub_tile_shape.prod()
+
+        super().__init__(dtype, element_count, sub_tile_shape.prod())
+        self.add_dependency(TensorViewNVRTC, GemmBasicKernel)
+        self.add_param_class("tmap", tmap, "ThreadMap")
+        self.advance_axis = advance_axis
+        self.num_threads = num_threads
+        self.transposed_input = transposed_input
+
+        self.interleave = sub_tile_shape[0]
+        self.smem_shape = smem_shape
+        self.smem_vis_shape = seq(smem_shape[0] // self.interleave,
+                                  smem_shape[1] * self.interleave)
+        self.static_stride = smem_shape[1]
+        self.static_inc_strided = self.static_stride * self.interleave * self.iteration_delta[
+            0] * self.dtype.itemsize()
+        if self.advance_axis == 1:
+            self.static_inc_advance = self.tile_shape[1] * self.dtype.itemsize(
+            )
+        else:
+            self.static_inc_advance = self.static_stride * self.tile_shape[
+                0] * self.dtype.itemsize()
+
+        self.fragment_t = array_type(dtype, self.element_count)
+        self.add_member("pointer_", self.byte_pointer)
+        # self.add_member("stride_", str(self.index_t))
+        # self.add_member("inc_strided_", str(self.index_t))
+        # self.add_member("inc_advance_", str(self.index_t))
+
+        # cudasim members
+        self.pointer_ = None  # type: Optional[ArrayPtr]
+        self.stride_ = 0
+        self.inc_strided_ = 0
+        self.inc_advance_ = 0
+
+    @pccm.cuda.constructor(device=True, forceinline=True)
+    def ctor(self):
+        contig = 1
+        strided = 0
+        code = pccm.FunctionCode(f"""
+        auto thread_offset = ThreadMap::initial_offset(thread_id);
+        """)
+        code.raw(f"""
+        int offset = (thread_offset[1] / {self.interleave}) * {self.smem_shape[1] * self.interleave}
+                + thread_offset[0] * {self.interleave};
+        """)
+
+        code.raw(f"""
+        pointer_ = reinterpret_cast<{self.byte_pointer}>(ptr + offset);
+        """)  # .ctor_init("stride_", "stride")
+        code.arg("stride", "int")
+        code.arg("ptr", f"{self.dtype}*")
+        code.arg("thread_id", "int")
+        return code
+
+
+    def get_smem_vis_shape(self) -> MetaArray[int]:
+        return self.smem_vis_shape
+
+    @pccm.cuda.member_function(device=True, forceinline=True)
+    def tile_increment(self):
+        code = pccm.FunctionCode(f"""
+        pointer_ += {self.static_inc_advance} * num;
+        """)
+        return code.arg("num", "int")
+
+    @pccm.cuda.member_function(name="operator++",
+                               device=True,
+                               forceinline=True)
+    def operator_pp(self):
+        code = pccm.FunctionCode(f"""
+        pointer_ +=  {self.static_inc_advance};
+        return *this;
+        """)
+        return code.ret(f"{self.class_name}&")
+
+    @pccm.cuda.member_function(name="operator--",
+                               device=True,
+                               forceinline=True)
+    def operator_ss(self):
+        code = pccm.FunctionCode(f"""
+        pointer_ -=  {self.static_inc_advance};
+        return *this;
+        """)
+        return code.ret(f"{self.class_name}&")
+
+    @pccm.cuda.member_function(device=True, forceinline=True)
+    def store_with_pointer_offset(self):
+        contig = 1
+        strided = 0
+        # TODO should we swap sc for transposed input?
+        code = pccm.FunctionCode(f"""
+        {self.access_t} const *frag_ptr = reinterpret_cast<{self.access_t} const *>(&frag);
+        {self.byte_pointer} byte_pointer =
+            pointer_ + pointer_offset * sizeof({self.dtype});
+
+        TV_PRAGMA_UNROLL
+        for (int s = 0; s < {self.thread_access_shape[strided]}; ++s) {{
+            {self.dtype} *access_ptr =
+                reinterpret_cast<{self.dtype} *>(byte_pointer);
+            TV_PRAGMA_UNROLL
+            for (int c = 0; c < {self.thread_access_shape[contig]}; ++c) {{
+                int idx = c + s * {self.thread_access_shape[contig]};
+                for (int e = 0; e < {self.element_per_acc}; ++e)
+                access_ptr[c * {self.iteration_delta[contig]} + e * {self.static_stride}] =
+                    reinterpret_cast<const {self.dtype}*>(&frag_ptr[idx])[e];
+            }}
+            if (s < {self.thread_access_shape[strided] - 1}) {{
+                byte_pointer += {self.static_inc_strided};
+            }}
+        }}
+        """)
+        code.arg("frag",
+                 f"{self.fragment_t} const &").arg("pointer_offset",
+                                                   str(self.index_t))
+        return code
+
+    @pccm.cuda.member_function(device=True, forceinline=True)
+    def store(self):
+        code = pccm.FunctionCode(f"""
+        store_with_pointer_offset(frag, 0);
+        """)
+        code.arg("frag", f"{self.fragment_t} const &")
+        return code
+
 
 
 class MaskTileIteratorParams(pccm.ParameterizedClass):

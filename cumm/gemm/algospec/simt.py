@@ -164,9 +164,7 @@ class MmaSimt(bases.Mma):
                  trans_a: bool,
                  trans_b: bool,
                  tensorop: Optional[TensorOp] = None,
-                 algo: GemmAlgo = GemmAlgo.Simt,
-                 is_depthwise: bool = False):
-        self.is_depthwise = is_depthwise
+                 algo: GemmAlgo = GemmAlgo.Simt):
         self._input_spec = input_spec
         is_dp4a = algo == GemmAlgo.SimtDP4A
         # input_sub_tile_shape_a = input_spec.
@@ -263,15 +261,6 @@ class MmaSimt(bases.Mma):
             True,
             partk=self.partk)
 
-        warp_b_is_depthwise = self.is_depthwise
-        is_depthwise_k = False
-        if self.is_depthwise:
-            if input_spec.trans_b:          # tnt,  Fwd
-                is_depthwise_k = True
-            elif not input_spec.trans_a:        # ttt,  BwdInput
-                is_depthwise_k = False
-            else:                           # ntt,  BwdWeight 
-                warp_b_is_depthwise = False
 
         self._warp_iter_b = mask_iters.WarpTileIterator(
             dtype_b,
@@ -283,9 +272,7 @@ class MmaSimt(bases.Mma):
             self.lane_layout,
             padding_n,
             False,
-            partk=self.partk,
-            is_depthwise_expand=warp_b_is_depthwise,
-            is_depthwise_expand_k=is_depthwise_k)
+            partk=self.partk)
         # if dtype_a == dtypes.float16 and dtype_b == dtypes.float16:
         #     self._warp_mma = WarpMmaSimt(
         #         (thread_mma_shape[0], thread_mma_shape[1], lane_mma_shape[2]),

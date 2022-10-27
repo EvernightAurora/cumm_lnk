@@ -215,7 +215,7 @@ class AlgoSpecificSimt(object):
                                     mask_sparse, increment_k_first)
         self.mma_spec = MmaSimt(self.input_spec, tile_shape, warp_tile_shape,
                                 num_stage, dtype_a, dtype_b, dtype_acc,
-                                trans_a, trans_b, tensorop, algo, is_depthwise=is_depthwise)
+                                trans_a, trans_b, tensorop, algo)
         shuffle_stride = ShuffleStrideType.NoShuffle
         if mask_sparse and not problem.op_type == ConvOpType.kBackwardWeight:
             shuffle_stride = ShuffleStrideType.ShuffleAC
@@ -231,5 +231,4 @@ class AlgoSpecificSimt(object):
                                       tensorop,
                                       algo,
                                       shuffle_stride=shuffle_stride,
-                                      access_per_vector=access_per_vector,
-                                      is_depthwise_wgrad=(problem.op_type == ConvOpType.kBackwardWeight and is_depthwise))
+                                      access_per_vector=access_per_vector)

@@ -28,7 +28,7 @@ from cumm.common import (GemmBasic, GemmBasicKernel, GemmKernelFlags, TensorView
                          TensorViewNVRTCKernel)
 from cumm.constants import CUMM_MAXIMUM_NVRTC_CONV_NDIM
 from cumm.conv import input_iters
-from cumm.conv.algospec import get_algo_spec
+from cumm.conv.algospec import get_algo_spec, DEPTHWISE_SPEC
 from cumm.conv.bases import (LAYOUT_TYPES, ConvIterAlgo,
                              ConvIterParams, ConvLayout, ConvOpType, ConvGroupMode)
 from cumm.conv.params import ConvProblem
@@ -671,10 +671,14 @@ class ConvKernel(GemmComponentBase):
         self.algo = algo
         self.shuffle_stride = ShuffleStrideType.NoShuffle
         self.access_per_vector = access_per_vector
-        algo_spec = get_algo_spec(self.algo)(
+        if group_mode == ConvGroupMode.kDepthwise:
+            spec_method = DEPTHWISE_SPEC
+        else:
+            spec_method = get_algo_spec(self.algo)
+        algo_spec = spec_method(
             problem, tile_shape, warp_tile_shape, num_stage, dtype_a, dtype_b,
             dtype_c, dtype_acc, dtype_comp, iter_algo, tensorop, algo,
-            mask_sparse, increment_k_first, access_per_vector, is_depthwise = (group_mode == ConvGroupMode.kDepthwise))
+            mask_sparse, increment_k_first, access_per_vector)
         self.algo_spec = algo_spec
         self.input_spec = algo_spec.input_spec
         self.mma_spec = algo_spec.mma_spec
@@ -704,7 +708,8 @@ class ConvKernel(GemmComponentBase):
         self.gemm_smem_storage = BlockMmaStorage(tile_shape,
                                                  seq(0, padding_mn[0]),
                                                  seq(0, padding_mn[1]),
-                                                 num_stage, dtype_a, dtype_b)
+                                                 num_stage, dtype_a, dtype_b, 
+                                                 hasattr(self.input_spec, "require_smem_b") and (not self.input_spec.require_smem_b))
         self.out_smem_storage = OutputSmemStorage(
             seq(
                 tile_shape[0] // self.output_spec.num_out_iters *
@@ -1214,11 +1219,11 @@ class ConvKernel(GemmComponentBase):
                     """)
             # if self.problem.op_type == ConvOpType.kBackwardWeight:
             #     code.raw(f"""
-            #     if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0){{
+            #     if (blockIdx.x == 0 && blockIdx.y == 8 && blockIdx.z == 0 && threadIdx.x == 0){{
             #         int wia, wib;
             #         for (wia=0; wia<8; ++wia){{
             #             for (wib=0; wib<4; ++wib)  
-            #                 printf("%.2lf-", accumulators[wia * 4 + wib]);
+            #                 printf("%.8f -\t", accumulators[wia * 4 + wib]);
             #             printf("\\n");
             #             }}
             #     }}

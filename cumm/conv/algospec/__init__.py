@@ -12,5 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cumm.conv.algospec.all import get_algo_spec
+from cumm.conv.algospec.all import get_algo_spec, DEPTHWISE_SPEC
 from cumm.conv.algospec.simt import AlgoSpecificSimt

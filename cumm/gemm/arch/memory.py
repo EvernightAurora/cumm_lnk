@@ -242,3 +242,15 @@ class SharedLdSt(pccm.ParameterizedClass):
         """)
         self.shared_load(code, True)
         return code
+    
+    @pccm.cuda.static_function(device=True, forceinline=True)
+    def load(self):
+        code = pccm.code()
+        code.targ('T')
+        code.arg("dst", "T*")
+        code.arg("ptr_", "const void*")
+        code.raw("""
+            uint32_t ptr = tv::gemm::get_smem_pointer(ptr_);
+        """)
+        self.shared_load(code, False)
+        return code

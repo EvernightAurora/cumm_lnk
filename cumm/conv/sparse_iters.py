@@ -152,7 +152,7 @@ class ForwardDgradSparseIOIterator(bases.ConvInputIterator):
                 self.sub_tile_shape[0], self.access_per_vector))
         self.add_param_class("mask", self.mask_cls, "Mask")
 
-        assert tmap.iterations.prod() * self.sub_tile_shape[0] < 32
+        assert tmap.iterations.prod() * self.sub_tile_shape[0] <= 32
         self.gload = GlobalLoad(self.element_per_acc * self.dtype.itemsize(),
                                 level="L2",
                                 prefetch_size=128)

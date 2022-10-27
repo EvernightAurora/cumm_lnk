@@ -19,6 +19,7 @@ from cumm.gemm.algospec import GemmAlgo
 from .simt import AlgoSpecificSimt
 from .turing import AlgoSpecificTuring
 from .volta import AlgoSpecificVolta
+from .simt_depthwise import AlgoSpecificSimtDepthwise
 
 _ALGOSPEC_TYPES = Union[Type[AlgoSpecificSimt], Type[AlgoSpecificVolta],
                         Type[AlgoSpecificTuring]]
@@ -34,3 +35,5 @@ ALGO_TO_SPEC: Dict[GemmAlgo, _ALGOSPEC_TYPES] = {
 
 def get_algo_spec(algo: GemmAlgo):
     return ALGO_TO_SPEC[algo]
+
+DEPTHWISE_SPEC = AlgoSpecificSimtDepthwise

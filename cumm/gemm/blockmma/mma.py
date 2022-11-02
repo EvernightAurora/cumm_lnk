@@ -41,7 +41,7 @@ class BlockMmaStorage(pccm.ParameterizedClass):
     def __init__(self, tile_shape: MetaArray[int],
                  smem_padding_a: MetaArray[int],
                  smem_padding_b: MetaArray[int], num_stage: int,
-                 dtype_a: dtypes.DType, dtype_b: dtypes.DType, no_smem_b: bool = False):
+                 dtype_a: dtypes.DType, dtype_b: dtypes.DType):
         super().__init__()
         self.tile_shape = tile_shape
         self.smem_padding_a = smem_padding_a
@@ -62,9 +62,6 @@ class BlockMmaStorage(pccm.ParameterizedClass):
                                   self.smem_alignment) * self.smem_alignment
         self.smem_size_b = div_up(self.smem_size_b,
                                   self.smem_alignment) * self.smem_alignment
-        if no_smem_b:
-            self.smem_size_b = 0
-            self.smem_shape_b = seq(0, 0)
 
         self.smem_size = self.smem_size_a + self.smem_size_b
 

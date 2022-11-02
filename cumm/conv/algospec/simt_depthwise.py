@@ -24,7 +24,7 @@ from cumm.gemm import constants, layout, mask_iters, thread_map
 from cumm.gemm.algospec import bases
 from cumm.gemm.algospec.core import GemmAlgo, ShuffleStrideType, TensorOp
 from cumm.gemm.algospec.simt import MmaSimt, OutputSimt
-from cumm.gemm.algospec.simt_depthwise import MmaSimtDepthwise
+from cumm.gemm.algospec.simt_depthwise import MmaSimtDepthwise, MmaSimtDepthwiseV2
 from cumm.conv.algospec.simt import InputSimt
 from cumm.gemm.core import MetaArray, metaseq, seq
 
@@ -223,6 +223,145 @@ class InputSimtDepthwise(bases.Input):
         return self._tile_shape
 
 
+class InputSimtDepthwiseV2(bases.Input):
+    def __init__(self,
+                 problem: ConvProblem,
+                 iter_algo: ConvIterAlgo,
+                 tile_shape: MetaArray[int],
+                 warp_tile_shape: MetaArray[int],
+                 dtype_a: dtypes.DType,
+                 dtype_b: dtypes.DType,
+                 algo: GemmAlgo = GemmAlgo.Simt,
+                 mask_sparse: bool = False,
+                 increment_k_first: bool = False,
+                 access_per_vector: int = 1):
+        assert mask_sparse
+        assert problem.op_type != ConvOpType.kBackwardWeight, "only optim for fwd & bwdI"
+        assert tile_shape[2] == tile_shape[1] == warp_tile_shape[2] == warp_tile_shape[1] 
+        ndim = problem.ndim
+        self.problem = problem
+        self.iter_algo = iter_algo
+        self.access_per_vector = access_per_vector
+        trans_a, trans_b, _ = problem.get_gemm_trans_abc()
+        self._trans_a = trans_a
+        self._trans_b = trans_b
+        self._layout_a, self._layout_b = problem.get_a_b_layout_class()
+        self.input_trans_load_a = False
+        self.input_trans_load_b = False
+        self.input_last_residual = True
+        m = tile_shape[0]
+        n = tile_shape[1]
+        k = tile_shape[2]
+        self._tile_shape = tile_shape
+
+
+        self.warp_count_shape = tile_shape // warp_tile_shape
+        self.warp_count = self.warp_count_shape.prod()
+        self.num_threads = self.warp_count * constants.WARP_SIZE
+
+        self.input_tile_shape_a = seq(m, k)
+        if trans_a:
+            self.input_tile_shape_a = seq(k, m)
+        b_load_k = k
+        b_load_n = n
+        if problem.op_type == ConvOpType.kForward:
+            b_load_k = max(1, constants.WARP_SIZE // b_load_n)
+        elif problem.op_type == ConvOpType.kBackwardInput:
+            b_load_n = max(1, constants.WARP_SIZE // b_load_k)
+        self.input_tile_shape_b = seq(b_load_k, b_load_n)
+        if trans_b:
+            self.input_tile_shape_b = seq(b_load_n, b_load_k)
+        self.advance_axis_a = 0 if trans_a else 1
+        self.advance_axis_b = 1 if trans_b else 0
+
+        access_size_bits = 128
+        self.alignment_a = access_size_bits // dtype_a.bitsize()
+        self.alignment_b = 1
+        self.input_sub_tile_shape_a = seq(1, self.alignment_a)
+        self.input_sub_tile_shape_b = seq(1, self.alignment_b)
+        
+        self.tmap_a = thread_map.PitchLinearDepthwiseA(self.input_tile_shape_a, self.input_sub_tile_shape_a,
+                                                        self.num_threads)
+        
+        self._thread_mma_shape = self.tmap_a.thread_mma_shape
+        self._lane_mma_shape = seq(self.tmap_a.lane_mma_shape[0], self.tmap_a.lane_mma_shape[1], 1)
+        self._warp_shape = self.tmap_a.warp_shape
+
+        self.tmap_b = thread_map.PitchLinearDepthwiseB(self.input_tile_shape_b, self.input_sub_tile_shape_b, 
+                                                        self.warp_shape, self.thread_mma_shape, self.num_threads)
+        
+        self.padding_mn = seq(0, 0)
+        if self.access_per_vector == 0:
+            inp_iter_cls = sparse_iters.ForwardDgradSparseIOIteratorV2Mask
+            w_iter_cls = input_iters.WeightIteratorDP4AV2Mask
+
+        else:
+            inp_iter_cls = sparse_iters.ForwardDgradSparseIOIterator
+            w_iter_cls = input_iters.WeightIteratorDP4A
+        self.inp_iter_a = inp_iter_cls(
+            dtype_a,
+            problem.op_type,
+            tile_shape,
+            self.input_sub_tile_shape_a,
+            self.tmap_a,
+            self.problem,
+            increment_k_first,
+            access_per_vector=access_per_vector)
+
+        self.inp_iter_b = w_iter_cls(
+            dtype_b,
+            problem.op_type,
+            tile_shape,
+            self.input_sub_tile_shape_b,
+            self.tmap_b,
+            self.problem,
+            self.layout_b,
+            optimized=iter_algo == ConvIterAlgo.Optimized,
+            increment_k_first=increment_k_first,
+            access_per_vector=access_per_vector)
+
+
+    @property
+    def layout_a(self) -> LAYOUT_TYPES:
+        return self._layout_a
+
+    @property
+    def layout_b(self) -> LAYOUT_TYPES:
+        return self._layout_b
+
+    @property
+    def input_iter_a(self) -> ConvInputIterator:
+        return self.inp_iter_a
+
+    @property
+    def input_iter_b(self) -> ConvInputIterator:
+        return self.inp_iter_b
+
+    @property
+    def trans_a(self) -> bool:
+        return self._trans_a
+
+    @property
+    def trans_b(self) -> bool:
+        return self._trans_b
+
+    @property
+    def tile_shape(self) -> MetaArray[int]:
+        return self._tile_shape
+    
+    @property
+    def warp_shape(self) -> MetaArray[int]:
+        return self._warp_shape
+    
+    @property
+    def thread_mma_shape(self) -> MetaArray[int]:
+        return self._thread_mma_shape
+    
+    @property
+    def lane_mma_shape(self) -> MetaArray[int]:
+        return self._lane_mma_shape
+
+
 class AlgoSpecificSimtDepthwise(object):
     def __init__(self,
                  problem: ConvProblem,
@@ -243,12 +382,21 @@ class AlgoSpecificSimtDepthwise(object):
         assert algo == GemmAlgo.Simt
         trans_a, trans_b, trans_c = problem.get_gemm_trans_abc()
 
-        self.input_spec = InputSimtDepthwise(problem, iter_algo, tile_shape,
-                                    warp_tile_shape, dtype_a, dtype_b, algo,
-                                    mask_sparse, increment_k_first)
-        self.mma_spec = MmaSimtDepthwise(self.input_spec, tile_shape, warp_tile_shape,
-                                num_stage, dtype_a, dtype_b, dtype_acc,
-                                trans_a, trans_b, tensorop, algo)
+        if problem.op_type != ConvOpType.kBackwardWeight and (tile_shape[1] == tile_shape[2] == warp_tile_shape[1] == warp_tile_shape[2]):
+            self.specific_depthwise_v2_mma = True
+            self.input_spec = InputSimtDepthwiseV2(problem, iter_algo, tile_shape,
+                                        warp_tile_shape, dtype_a, dtype_b, algo,
+                                        mask_sparse, increment_k_first)
+            self.mma_spec = MmaSimtDepthwiseV2(self.input_spec, tile_shape, warp_tile_shape,
+                                    num_stage, dtype_a, dtype_b, dtype_acc,
+                                    trans_a, trans_b, tensorop, algo)
+        else:
+            self.input_spec = InputSimtDepthwise(problem, iter_algo, tile_shape,
+                                        warp_tile_shape, dtype_a, dtype_b, algo,
+                                        mask_sparse, increment_k_first)
+            self.mma_spec = MmaSimtDepthwise(self.input_spec, tile_shape, warp_tile_shape,
+                                    num_stage, dtype_a, dtype_b, dtype_acc,
+                                    trans_a, trans_b, tensorop, algo)
         shuffle_stride = ShuffleStrideType.NoShuffle
         if mask_sparse and not problem.op_type == ConvOpType.kBackwardWeight:
             shuffle_stride = ShuffleStrideType.ShuffleAC

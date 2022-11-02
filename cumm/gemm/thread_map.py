@@ -589,3 +589,106 @@ class Out5DLinear(pccm.ParameterizedClass):
                                 1) * self.part_shape[3] * self.part_dilation[3]
         advances[3] = stride * self.part_shape[3]
         return advances
+
+
+class PitchLinearDepthwiseA(InputThreadMapBase):
+    def __init__(self, tile_shape: MetaArray[int],
+                 sub_tile_shape: MetaArray[int], num_threads: int):         # tile:  (m, k);  sub_tile: (1, align),  num_threads:  32 * warps
+        super().__init__()                                                  # require twarp_N == t_N == t_K == twarp_k
+        self.add_dependency(TensorViewNVRTC)
+        self.tile_shape = tile_shape
+        self.sub_tile_shape = sub_tile_shape
+        self.num_threads = num_threads
+        self.num_warp = num_threads // constants.WARP_SIZE
+        self.warp_tile_shape = tile_shape // seq(self.num_warp, 1)
+
+        assert tile_shape[1] % sub_tile_shape[1] == 0
+        warp_shape_k = tile_shape[1] // sub_tile_shape[1]
+        warp_shape_m = constants.WARP_SIZE // warp_shape_k
+        self._warp_shape = seq(warp_shape_m, warp_shape_k)
+        assert self.warp_shape.prod() == constants.WARP_SIZE, "Not support shape"
+
+        self._iterations = seq(self.warp_tile_shape[0] // self.warp_shape[0], 1)
+        self._thread_mma_shape = self._lane_mma_shape = seq(self._iterations[0], self.sub_tile_shape[1])
+        self._delta = seq(1, -1)
+    
+    @property
+    def delta(self) -> MetaArray[int]:
+        return self._delta
+    
+    @property
+    def thread_mma_shape(self) -> MetaArray[int]:
+        return self._thread_mma_shape
+    
+    @property
+    def lane_mma_shape(self) -> MetaArray[int]:
+        return self._lane_mma_shape
+    
+    @property
+    def iterations(self) -> MetaArray[int]:
+        return self._iterations
+    
+    @property
+    def warp_shape(self) -> MetaArray[int]:
+        return self._warp_shape
+    
+    def initial_offset_python(self, thread_id: int):
+        warp_idx = thread_id // constants.WARP_SIZE
+        idx_residual = warp_idx % constants.WARP_SIZE
+        return seq(warp_idx * self.warp_tile_shape[0] + (idx_residual // self.warp_shape[1]) * self.thread_mma_shape[0],
+                    (idx_residual % self.warp_shape[1]) * self.thread_mma_shape[1])
+    
+    def __repr__(self):
+        return f"PitchLinearDepthwiseA[{self.iterations}|{self.delta}]"
+
+    @pccm.cuda.static_function(host=True, device=True, forceinline=True)
+    def initial_offset(self):
+        code = pccm.FunctionCode(f"""
+            int warp_idx = thread_id / {constants.WARP_SIZE};
+            int idx_residual = thread_id % {constants.WARP_SIZE};
+            return {{warp_idx * {self.warp_tile_shape[0]} + (idx_residual / {self.warp_shape[1]}) * {self.thread_mma_shape[0]}, 
+                                                            (idx_residual % {self.warp_shape[1]}) * {self.thread_mma_shape[1]}}};
+        """)
+        return code.arg("thread_id", "int").ret("tv::array<int, 2>")
+
+
+class PitchLinearDepthwiseB(InputThreadMapBase):
+    def __init__(self, tile_shape: MetaArray[int],
+                 sub_tile_shape: MetaArray[int], 
+                 warp_shape: MetaArray[int],
+                 thread_mma_shape: MetaArray[int],
+                 num_threads: int):                                         # tile:  [k, 1] if !trans else [n, 1]
+        super().__init__()                                                  # require twarp_N == t_N == t_K == twarp_k
+        self.add_dependency(TensorViewNVRTC)
+        self.tile_shape = tile_shape
+        self.warp_shape = warp_shape
+        self.thread_mma_shape = thread_mma_shape
+        self.sub_tile_shape = sub_tile_shape
+        
+        assert sub_tile_shape[1] == 1 and sub_tile_shape[1] == 1, "only support depthwise fprop/bwdI input_iter_B"
+        self._iterations = seq(thread_mma_shape[1], 1)
+        self._delta = seq(1, -1)
+        assert thread_mma_shape[1] * warp_shape[1] == tile_shape[0]
+
+    
+    @property
+    def delta(self) -> MetaArray[int]:
+        return self._delta
+
+    @property
+    def iterations(self) -> MetaArray[int]:
+        return self._iterations
+    
+    def initial_offset_python(self, thread_id: int):
+        return seq((thread_id % self.warp_shape[1]) * self.thread_mma_shape[1],
+                    0)
+    
+    def __repr__(self):
+        return f"PitchLinearDepthwiseB[{self.iterations}|{self.delta}]"
+
+    @pccm.cuda.static_function(host=True, device=True, forceinline=True)
+    def initial_offset(self):
+        code = pccm.FunctionCode(f"""
+            return {{(thread_id % {self.warp_shape[1]}) * {self.thread_mma_shape[1]}, 0}}; 
+        """)
+        return code.arg("thread_id", "int").ret("tv::array<int, 2>")

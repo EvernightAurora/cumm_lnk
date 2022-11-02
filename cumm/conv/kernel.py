@@ -38,7 +38,7 @@ from cumm.gemm import (codeops, constants, gemmmath, layout, mask_iters,
                        volta_out_iters)
 from cumm.gemm.algospec import GemmAlgo, TensorOp, bases
 from cumm.gemm.algospec.core import ShuffleStrideType, get_min_arch_of_algo
-from cumm.gemm.blockmma import BlockMmaStorage, Mma, MmaMultiStage, SharedMemoryClearOption, MmaDepthwiseConvPipelined
+from cumm.gemm.blockmma import BlockMmaStorage, Mma, MmaMultiStage, SharedMemoryClearOption, MmaDepthwiseConvPipelined, MmaDepthwiseConvPipelinedV2
 from cumm.gemm.core import MetaArray, array_type, metaseq, seq
 from cumm.gemm.constants import NVRTCMode
 from cumm.gemm.outputs import Output, OutputSmemStorage
@@ -708,8 +708,9 @@ class ConvKernel(GemmComponentBase):
         self.gemm_smem_storage = BlockMmaStorage(tile_shape,
                                                  seq(0, padding_mn[0]),
                                                  seq(0, padding_mn[1]),
-                                                 num_stage, dtype_a, dtype_b, 
-                                                 hasattr(self.input_spec, "require_smem_b") and (not self.input_spec.require_smem_b))
+                                                 num_stage, dtype_a, dtype_b)
+        if hasattr(self.algo_spec, "specific_depthwise_v2_mma"):
+            self.gemm_smem_storage = BlockMmaStorage(seq(0, 0, 0), seq(0, 0), seq(0, 0), num_stage, dtype_a, dtype_b)
         self.out_smem_storage = OutputSmemStorage(
             seq(
                 tile_shape[0] // self.output_spec.num_out_iters *
@@ -759,18 +760,32 @@ class ConvKernel(GemmComponentBase):
         # but gemm need it. gemm clear frag in iter.load, so we don't need
         # initial clear in mma.
         if self.group_mode == ConvGroupMode.kDepthwise:
-            self.mma_container = MmaDepthwiseConvPipelined(
-                dtype_acc,
-                self.partk,
-                num_stage,
-                self.mma_spec,
-                self.gemm_smem_storage,
-                first_input_clear=False,
-                clear_mask=False,
-                mask_sparse=self.mask_sparse,
-                increment_k_first=increment_k_first,
-                op_type= self.problem.op_type
-            )
+            if hasattr(self.algo_spec, "specific_depthwise_v2_mma"):
+                self.mma_container = MmaDepthwiseConvPipelinedV2(
+                    dtype_acc,
+                    self.partk,
+                    num_stage,
+                    self.mma_spec,
+                    self.gemm_smem_storage,
+                    first_input_clear=False,
+                    clear_mask=False,
+                    mask_sparse=self.mask_sparse,
+                    increment_k_first=increment_k_first,
+                    op_type= self.problem.op_type
+                )
+            else:
+                self.mma_container = MmaDepthwiseConvPipelined(
+                    dtype_acc,
+                    self.partk,
+                    num_stage,
+                    self.mma_spec,
+                    self.gemm_smem_storage,
+                    first_input_clear=False,
+                    clear_mask=False,
+                    mask_sparse=self.mask_sparse,
+                    increment_k_first=increment_k_first,
+                    op_type= self.problem.op_type
+                )
             if self.problem.op_type == ConvOpType.kBackwardWeight:
                 self.add_param_class("depth_transformer", algo_spec.output_spec.depth_transformer, "DepthwiseTransformer")
         elif self.algo == GemmAlgo.Ampere and (self.mask_sparse == False or self.increment_k_first) and self.access_per_vector == 1:
@@ -864,6 +879,8 @@ class ConvKernel(GemmComponentBase):
     @pccm.cuda.cuda_global_function  # (inline=True)
     def conv_kernel(self):
         code = pccm.cuda.PTXCode()
+        # if self.group_mode == ConvGroupMode.kDepthwise and self.problem.op_type == ConvOpType.kForward:
+        #     code.raw("clock_t t=clock();")
         # code.add_pre_attr(f"__launch_bounds__({self.num_threads}, 4)")
         if self.is_nvrtc:
             if self.nvrtc_mode != NVRTCMode.ConstantMemory:
@@ -1196,11 +1213,19 @@ class ConvKernel(GemmComponentBase):
                         # TODO split algo requires to run output even if mask is zero for bias.
                         if self.problem.op_type == ConvOpType.kForward:
                             # we can't exit early when have bias/act for forward.
+                            # if self.group_mode == ConvGroupMode.kDepthwise and self.problem.op_type == ConvOpType.kForward:
+                            #     code.raw("__syncwarp();t = clock();")
                             code.raw(f"""
                             if (kmask != 0){{
                                 mma(params.gemm_k_iterations, accumulators, input_iter_A, input_iter_B, accumulators, kmask,  params.problem.kernel_volume);
                             }}
                             """)
+                            # if self.group_mode == ConvGroupMode.kDepthwise and self.problem.op_type == ConvOpType.kForward:
+                            #     code.raw("""
+                            #         t = clock() - t;
+                            #         if (blockIdx.x <= 10 && blockIdx.y == 0 && threadIdx.x == 0)
+                            #             printf("B%d ad mma use %lld clock\\n", blockIdx.x, (long long)t);
+                            #     """)
                         else:
                             code.raw(f"""
                             mma(params.gemm_k_iterations, accumulators, input_iter_A, input_iter_B, accumulators, kmask,  params.problem.kernel_volume);
@@ -1291,6 +1316,8 @@ class ConvKernel(GemmComponentBase):
             code.raw(
                 f"Output out(out_shared_mem, thread_idx, warp_idx_k, warp_m, warp_n, lane_idx);"
             )
+            # if self.group_mode == ConvGroupMode.kDepthwise and self.problem.op_type == ConvOpType.kForward:
+            #     code.raw("__syncwarp();t = clock();")
             if self.splitk_serial:
                 with code.if_("need_self_reduce"):
                     code.raw(
@@ -1311,7 +1338,13 @@ class ConvKernel(GemmComponentBase):
                     )
                 else:
                     code.raw(f"out.run(output_op, accumulators, out_iter_C);")
-
+            # if self.group_mode == ConvGroupMode.kDepthwise and self.problem.op_type == ConvOpType.kForward:
+            #     code.raw("""
+        
+            #         t = clock() - t;
+            #         if (blockIdx.x <= 10 && blockIdx.y == 0 && threadIdx.x == 0)
+            #             printf("B%d ad output_op use %lld clock\\n", blockIdx.x, (long long)t);
+            #     """)
             if self.splitk_serial:
                 code.raw(f"""
                 if (params.grid_dims.z > 1){{
@@ -1334,6 +1367,13 @@ class ConvKernel(GemmComponentBase):
             assert(0);
             """)
         code.macro_endif_()
+        # if self.group_mode == ConvGroupMode.kDepthwise and self.problem.op_type == ConvOpType.kForward:
+        #     code.raw("""
+    
+        #         t = clock() - t;
+        #         if (blockIdx.x < 10 && blockIdx.y == 0 && threadIdx.x == 0)
+        #             printf("B%d ad full use %lld clock\\n", blockIdx.x, (long long)t);
+        #     """)
         return code
 
     def _nvrtc_params_template(self,

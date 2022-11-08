@@ -1456,6 +1456,7 @@ class MmaDepthwiseConvPipelinedV2(GemmComponentBase):  # optim: no smem, only fo
         code.arg("src_accumulators", f"{self.accumulator_fragment} const&")
         code.arg("mask", f"uint32_t")
         code.arg("RS", f"int")
+
         code.raw(f"""
         accumulators = src_accumulators;
         {self.input_spec.input_iter_a.fragment_t} input_frag_A[2];
@@ -1474,7 +1475,7 @@ class MmaDepthwiseConvPipelinedV2(GemmComponentBase):  # optim: no smem, only fo
         // now input iter point to a valid location, mask iter point to this location too.
         input_iter_A.update_indices();
 
-        //input_iter_A.load(input_frag_A[0]);
+        input_iter_A.load(input_frag_A[0]);
         input_iter_B.load(input_frag_B[0]);
 
         while(!mask_iter.end){{
@@ -1499,7 +1500,7 @@ class MmaDepthwiseConvPipelinedV2(GemmComponentBase):  # optim: no smem, only fo
                 input_iter_B.clear_all_mask_if_pred(mask_iter.end);
                 input_iter_A.update_indices();
 
-                //input_iter_A.load(input_frag_A[stage_idx ^ 1]);
+                input_iter_A.load(input_frag_A[stage_idx ^ 1]);
                 input_iter_B.load(input_frag_B[stage_idx ^ 1]);
 
                 warp_mma(accumulators, input_frag_A[stage_idx],

@@ -1358,6 +1358,14 @@ class MmaDepthwiseConvPipelinedV2(GemmComponentBase):  # optim: no smem, only fo
         self.add_param_class("mma_ns_wmma", spec.warp_mma, "WarpMma")
         self.wmma = spec.warp_mma
 
+        self.enable_v2 = False
+        if self.spec.input_spec.input_iter_a.can_multistage_load():
+            self.iterA_params = list(self.spec.input_spec.input_iter_a.enumurate_get_param())
+            if len(self.iterA_params) != self.spec.thread_mma_shape[0]:
+                return
+            else:
+                self.enable_v2 = True
+
         # cudasim
 
     def min_arch(self) -> Optional[Tuple[int, int]]:
@@ -1511,9 +1519,87 @@ class MmaDepthwiseConvPipelinedV2(GemmComponentBase):  # optim: no smem, only fo
         
         """)
         return code
+
+    def call_mask_sparse_k_first_pipelined_V2(self):
+        '''
+        from pipelined mma depthwise mma.
+        no complex logical code.
+        no smem used, only input iter
+        pipelined
+        '''
+        code = pccm.code()
+        code.arg("gemm_k_iterations", f"int")
+        code.arg("accumulators", f"{self.accumulator_fragment}&")
+        code.arg("input_iter_A", f"InputIteratorA &")
+        code.arg("input_iter_B", f"InputIteratorB &")
+        code.arg("src_accumulators", f"{self.accumulator_fragment} const&")
+        code.arg("mask", f"uint32_t")
+        code.arg("RS", f"int")
+
+        code.raw(f"""
+        accumulators = src_accumulators;
+        {self.input_spec.input_iter_a.fragment_t} input_frag_A;
+        {self.input_spec.input_iter_b.fragment_t} input_frag_B;
+        
+        WarpMma warp_mma;
+        // mask = 0xffffffff;
+        MaskIGemmIterator mask_iter(gemm_k_iterations, RS, mask);
+        // find initial gemm index
+        int channel_start_idx = 0;
+        while (!mask_iter.valid()){{
+            ++mask_iter;
+            input_iter_A.increment_filter();
+            input_iter_B.increment_filter();
+        }}
+        // now input iter point to a valid location, mask iter point to this location too.
+        input_iter_A.update_indices();
+
+        input_iter_A.load(input_frag_A);
+        input_iter_B.load(input_frag_B);
+
+        while(!mask_iter.end){{
+            
+            TV_PRAGMA_UNROLL
+            for (int warp_mma_subm = 0; warp_mma_subm < {len(self.iterA_params)}; ++warp_mma_subm){{
+                if (warp_mma_subm == 0){{
+                    input_iter_A.increment_k();
+                    input_iter_B.increment_k();
+
+                    input_iter_A.reset_k();
+                    input_iter_B.reset_k();
+                    ++mask_iter;
+                    input_iter_A.increment_filter();
+                    input_iter_B.increment_filter();
+                    while (!mask_iter.valid() && !mask_iter.end){{
+                        ++mask_iter;
+                        input_iter_A.increment_filter();
+                        input_iter_B.increment_filter();
+                    }}
+                    input_iter_A.clear_all_mask_if_pred(mask_iter.end);
+                    input_iter_B.clear_all_mask_if_pred(mask_iter.end);
+                    input_iter_A.update_indices();
+                }}
+                
+                warp_mma(accumulators, input_frag_A,
+                            input_frag_B, accumulators, warp_mma_subm);
+                {"".join(
+                    [f"if (warp_mma_subm == {i}) input_iter_A.load_ptr_with_param_to_frag({self.iterA_params[(i)%len(self.iterA_params)]}, input_frag_A);" for i in range(len(self.iterA_params))]
+                )}
+                
+                
+
+                if (warp_mma_subm == {len(self.iterA_params) - 1})
+                    input_iter_B.load(input_frag_B);
+
+            }}
+        }}
+        """)
+        return code
     
     @pccm.cuda.member_function(device=True,
                                forceinline=True,
                                name="operator()")
     def call(self):
+        if self.enable_v2:
+            return self.call_mask_sparse_k_first_pipelined_V2()
         return self.call_mask_sparse_k_first_pipelined()

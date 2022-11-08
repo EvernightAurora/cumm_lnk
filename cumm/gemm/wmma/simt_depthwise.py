@@ -91,6 +91,36 @@ class WarpMmaSimtDepthwise(bases.WarpMma):
         """)
         return code
     
+    @pccm.cuda.member_function(name="operator()",
+                               device=True,
+                               forceinline=True)
+    def call_operator_one(self):
+
+        code = pccm.code()
+        code.arg("D", f"{self.fragment_c_t}&")
+        code.arg("A", f"{self.fragment_a_t} const &")
+        code.arg("B", f"{self.fragment_b_t} const &")
+        code.arg("C", f"{self.fragment_c_t} const &")
+        code.arg("m", "const int&")
+
+
+        code.raw(f"""
+        InstMma mma;
+        D = C;
+        TV_PRAGMA_UNROLL
+        for (int n = 0; n < {self.thread_mma_shape[1]}; ++n) {{
+            {self.mma.fragment_c_t} d;
+            {self.mma.fragment_a_t} a;
+            {self.mma.fragment_b_t} b;
+            d[0] = D[m * {self.thread_mma_shape[1]} + n];
+            a[0] = A[m * {self.thread_mma_shape[1]} + n];
+            b[0] = B[n];
+            mma(d, a, b, d);
+            D[m * {self.thread_mma_shape[1]} + n] = d[0];
+        }}
+
+        """)
+        return code
     
 
     async def __call__(self, D: ArrayPtr, A: ArrayPtr, B: ArrayPtr,

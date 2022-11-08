@@ -687,6 +687,34 @@ class ForwardDgradSparseIOIterator(bases.ConvInputIterator):
             return access_pointer;
         """)
         return code
+    
+    @pccm.cuda.member_function(device=True, forceinline=True)
+    def load_ptr_with_param_to_frag(self):
+        code = pccm.FunctionCode()
+        code.arg("s, c", "int")
+        code.arg("frag", f"{self.fragment_t}&")
+        code.raw(f"""
+            {self.access_t} *frag_ptr = reinterpret_cast<{self.access_t} *>(&frag);
+            int mask_idx = s * {self.tmap.iterations[1] * self.sub_tile_shape[0]} + 
+                c * {self.sub_tile_shape[0]} + 0;
+            auto indice_offset = get_indice_offset(s, c, 0);
+        """)
+        if self.is_wgrad_out:
+            code.raw(
+                f"bool valid = bool(mask_[0] & (1u << mask_idx));")
+        else:
+            code.raw(
+                f"bool valid = bool(mask_[0] & (1u << mask_idx)) && (indice_offset >= 0);"
+            )
+        code.raw(f"""
+            int idx = s * {self.tmap.iterations[1] * self.sub_tile_shape[0] * self.access_per_vector} + 
+                        c * {self.sub_tile_shape[0] * self.access_per_vector};
+            auto access_pointer = reinterpret_cast<{self.const_access_pointer}>(pointer_ + indice_offset + 
+                c * {self.dtype.nbytes_str(self.tmap.delta[1] * self.dtype.bitsize())}) + 0;
+            frag_ptr[idx].clear();
+            GlobalLoad::run(frag_ptr[idx], access_pointer, valid);
+        """)
+        return code
 
     @pccm.cuda.member_function(device=True, forceinline=True)
     def load(self):

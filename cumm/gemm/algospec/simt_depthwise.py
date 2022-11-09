@@ -96,8 +96,7 @@ class MmaSimtDepthwise(bases.Mma):
             min(lane_vec_load_shape[0], thread_mma_shape[0]),
             min(lane_vec_load_shape[1], thread_mma_shape[1]), 1)
         self.lane_mma_shape = lane_mma_shape
-        lane_interleave = 2 if thread_mma_shape[0] > 4 and thread_mma_shape[
-            1] > 4 else 1
+        lane_interleave = 1
         self.lane_layout = layout.RowMajorInterleaved(lane_interleave)
         self.warp_gemm_iters = warp_tile_shape[2] // lane_mma_shape[
             2]  # type: int

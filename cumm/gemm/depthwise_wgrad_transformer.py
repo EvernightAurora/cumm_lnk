@@ -121,7 +121,7 @@ class DepthwiseWgradTramsformer(bases.GemmComponentBase):
                 m_infact = w_m * {self.lane_mma_shape[0]} + {lane_mma_m_idx * self.warp_shape[0] * self.lane_mma_shape[0]} + {i % self.lane_mma_shape[0]};
                 n_seek = m_infact;
                 n_at_warp_idx_n = (n_seek / {self.lane_mma_shape[1]}) % {self.warp_shape[1]};
-                n_in_fragment_idx_n = (n_at_warp_idx_n / {self.warp_shape[1]}) * {self.lane_mma_shape[1]} + n_seek % {self.lane_mma_shape[1]};
+                n_in_fragment_idx_n = ((n_seek / {self.lane_mma_shape[1]}) / {self.warp_shape[1]}) * {self.lane_mma_shape[1]} + n_seek % {self.lane_mma_shape[1]};
 
                 seek_lane = layoutW(w_m, n_at_warp_idx_n);
                 provide_idx = layoutC({i}, n_in_fragment_idx_n);
@@ -167,7 +167,7 @@ class DepthwiseWgradTramsformer(bases.GemmComponentBase):
                 n_warp_idx = n_seek / {self.warp_tile_shape[1]};
                 n_warp_residual = n_seek % {self.warp_tile_shape[1]};
                 n_lane_idx_n = (n_warp_residual / {self.lane_mma_shape[1]}) % {self.warp_shape[1]};
-                n_in_fragment_idx_n = (n_lane_idx_n / {self.warp_shape[1]}) * {self.lane_mma_shape[1]} + n_warp_residual % {self.lane_mma_shape[1]};
+                n_in_fragment_idx_n = (((n_warp_residual / {self.lane_mma_shape[1]})) / {self.warp_shape[1]}) * {self.lane_mma_shape[1]} + n_warp_residual % {self.lane_mma_shape[1]};
 
                 provide_idx = layoutC({i}, n_in_fragment_idx_n);
                 save_idx = layoutC({i}, 0);

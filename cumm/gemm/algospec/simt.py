@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import enum
-from operator import is_
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type, Union
 
@@ -260,7 +259,6 @@ class MmaSimt(bases.Mma):
             padding_m,
             True,
             partk=self.partk)
-
 
         self._warp_iter_b = mask_iters.WarpTileIterator(
             dtype_b,

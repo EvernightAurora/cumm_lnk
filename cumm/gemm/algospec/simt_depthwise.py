@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import enum
-from operator import is_
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type, Union
 

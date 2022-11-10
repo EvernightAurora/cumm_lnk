@@ -666,7 +666,7 @@ class GemmMainUnitTest(pccm.ParameterizedClass):
                 
 
 
-                    *gen_gemm_params_xxrow((32, 16, 16), (16, 16, 16), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
+                    # *gen_gemm_params_xxrow((32, 16, 16), (16, 16, 16), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
                     # *gen_gemm_params_xxrow((64, 16, 16), (16, 16, 16), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
                     # *gen_gemm_params_xxrow((128, 16, 16), (16, 16, 16), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
                     # *gen_gemm_params_xxrow((64, 16, 16), (32, 16, 16), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
@@ -679,23 +679,7 @@ class GemmMainUnitTest(pccm.ParameterizedClass):
                     # *gen_gemm_params_xxrow((64, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
                     # *gen_gemm_params_xxrow((128, 32, 32), (64, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),
                     
-                    
-                    # *gen_grouped_conv_gemm_params((32, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8]), 
-                    #                                 ConvOpType.kForward, ConvGroupMode.kSingleGroup),
-                    # *gen_grouped_conv_gemm_params((32, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8]), 
-                    #                                 ConvOpType.kBackwardInput, ConvGroupMode.kSingleGroup),
-                    # *gen_grouped_conv_gemm_params((32, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8]), 
-                    #                                 ConvOpType.kBackwardWeight, ConvGroupMode.kSingleGroup),
 
-                    *gen_grouped_conv_gemm_params((32, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8]), 
-                                                    ConvOpType.kForward, ConvGroupMode.kSingleGroupUnaligned),
-                    *gen_grouped_conv_gemm_params((32, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8]), 
-                                                    ConvOpType.kBackwardInput, ConvGroupMode.kSingleGroupUnaligned),
-                    *gen_grouped_conv_gemm_params((32, 32, 32), (32, 32, 32), 2, "f16,f16,f16,f16,f16", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8]), 
-                                                    ConvOpType.kBackwardWeight, ConvGroupMode.kSingleGroupUnaligned),
-                    
-
-                    
                 ]
                 ampere_params = [
                     # *gen_gemm_params_xxrow((32, 32, 16), (16, 16, 16), 2, "tf32,tf32,f32,f32,f32", kernel.GemmAlgo.Turing, TensorOp([16, 8, 8])),

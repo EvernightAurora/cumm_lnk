@@ -782,23 +782,23 @@ def _asdv_test_turing_python(coord_input: bool = False):
                     vis_res[k2][k] = v2
 
             fig_per_group: Dict[int, vis.figure.ImageFigure] = {}
-            # A_bound = vis_gemm_input_2d(a_tv,
-            #                             blocks,
-            #                             threads,
-            #                             fig_per_group,
-            #                             vis_res["InputA"],
-            #                             "A", [0, 0],
-            #                             coord_input=coord_input)
-            # B_bound = vis_gemm_input_2d(b_tv,
-            #                             blocks,
-            #                             threads,
-            #                             fig_per_group,
-            #                             vis_res["InputB"],
-            #                             "B", [0, A_bound[3] + 10],
-            #                             coord_input=coord_input)
-            # O_bound = vis_gemm_output_2d(params.dtype_acc, blocks, threads,
-            #                              fig_per_group, vis_res["Output"], "O",
-            #                              [0, B_bound[3] + 10])
+            A_bound = vis_gemm_input_2d(a_tv,
+                                        blocks,
+                                        threads,
+                                        fig_per_group,
+                                        vis_res["InputA"],
+                                        "A", [0, 0],
+                                        coord_input=coord_input)
+            B_bound = vis_gemm_input_2d(b_tv,
+                                        blocks,
+                                        threads,
+                                        fig_per_group,
+                                        vis_res["InputB"],
+                                        "B", [0, A_bound[3] + 10],
+                                        coord_input=coord_input)
+            O_bound = vis_gemm_output_2d(params.dtype_acc, blocks, threads,
+                                         fig_per_group, vis_res["Output"], "O",
+                                         [0, B_bound[3] + 10])
 
             # print(TestCase().assertAllClose(c_tv, c)) 
             # print(c_tv.reshape(-1)[:10], c.reshape(-1)[:10])
@@ -814,7 +814,7 @@ def _asdv_test_turing_python(coord_input: bool = False):
                 print("NOT PASS")
                 assert(0)
 
-            # vis_in_relay(list(fig_per_group.values()))
+            vis_in_relay(list(fig_per_group.values()))
 
 
 if __name__ == "__main__":
